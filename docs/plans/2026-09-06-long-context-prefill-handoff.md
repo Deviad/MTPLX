@@ -582,3 +582,66 @@ the only tool that can drive *my own* wrappers' ports with a per-port session ba
   pre-rebase `d0518c9`. **Nothing has been pushed.**
 - Run tests with a pinned empty `HOME`/`MTPLX_HOME` or they will read the operator's live config
   (this is what produced two spurious failures during the rebase verification).
+
+### Task 7 — the long-context term lives inside the QSA layer: attribute it before wiring anything
+
+Written 2026-09-06 23:15, after Task 3 step 2 (the paged lane is unreachable by construction) and
+after the prompt-phase breakdown (a follow-up is 99.0 % suffix prefill and costs 1.065x the cold
+marginal rate of its band). This is the branch criterion 5 of the prefill issue names, and it is the
+only remaining engine-side lever for criteria 3 and 4.
+
+**The trap this task is sequenced to avoid.** Wiring `QSACache` into
+`install_vllm_metal_paged_attention_kv_cache` would make `paged_gqa_sdpa_calls` non-zero and satisfy
+criterion 5 *literally* while possibly moving criteria 3 and 4 not at all. That failure mode is
+already measured once in this plan: the dense-decode ceiling flips the executed layout and changes
+throughput by -0.30 % against a 1.61 % within-arm spread. A counter that fires is not a speedup.
+
+**What the code says the cost can be.** `models/qwen4_exp.py:3760-3786`: the QSA layer builds a
+selection mask from the indexer's pooled block keys, then `mx.take(k, sel_mask, axis=2)` /
+`mx.take(v, ...)` **gathers the selected rows into a fresh array**, then runs
+`mx.fast.scaled_dot_product_attention(q, k, v, mask=None)` on that subset. So the per-token work that
+grows with context is the indexer selection over the pooled table plus the gather over a KV of size
+ctx -- not a dense attention over the whole context. `QSACache` keeps `raw_keys`, `pooled` and
+`pooled_f32_t` as positional buffers keyed to `kv.offset` (`:1950-2016`), grows them geometrically
+after a documented O(N^2) incident (`_grown_cap`, `:1939`), and round-trips through the session bank
+via its `state` property (`:2099-2107`).
+
+- [ ] **Step 1 — find the knobs before building an instrument.** Enumerate what already varies the
+      selection cost: the indexer compress ratio (`indexer_compress_ratio`, default 4), the top-k
+      budget and its `_tiled_topk` / `_select_eager` paths (`:2322`, `:2357`), the
+      `_prepare_kernel_supported` gate (`:2182`), and any env that changes the engage threshold.
+      Deliverable: a list in this plan of each knob, its default, and whether it is env-reachable on
+      the serve path. No code change.
+- [ ] **Step 2 — attribute the long-context term by ablation, not by stopwatch.** Metal is async, so
+      `time.perf_counter()` around lazy ops measures graph building; honest per-region timing needs a
+      `mx.synchronize()` that itself perturbs the schedule. Prefer therefore: run matched cold
+      prefills at 52 k and 104 k while varying one knob from step 1 at a time (top-k budget, compress
+      ratio, eager vs tiled selection), and read the *row* fields shipped today
+      (`prompt_suffix_time_s`, `prompt_eval_time_s`, `new_prefill_tokens`). If a knob moves the
+      per-token cost, that region owns the term. Only if no knob is decisive, add an env-gated
+      synchronizing timer inside the layer, and report the flag-off versus flag-on totals so the
+      instrument's own cost is on the record.
+- [ ] **Step 3 — decide the fix from step 2's attribution.** Three candidate shapes, chosen by
+      evidence rather than preference: (a) block-align the KV so the gather reads contiguous blocks
+      and a paged kernel can serve the selected set -- this is where wiring `QSACache` into the paged
+      install would belong, and it must keep `raw_keys`/`pooled` positional semantics, `trim(n)` for
+      speculative rollback, and the `state` round-trip intact; (b) make the selection cheaper (pooled
+      layout, threshold, or tiling) if step 2 puts the term there; (c) accept the curve and hold
+      context client-side under ~60 k, which is what criterion 5 already names as the honest outcome.
+      Record the choice and its evidence in this plan before writing product code.
+- [ ] **Step 4 — acceptance, measured on the serve harness.** Cold 103 k prefill <= 134 s
+      (criterion 4) and follow-up <= 1.40 s as the median of >= 3 runs (criterion 3), on a fresh
+      server with an emptied bank, with `prefill_layout` / `prefill_attention_impl` and the four
+      prompt-breakdown keys present on the rows so the win is attributable and not inferred. Plus:
+      the 15 request-observability goldens unchanged except for declared additions, and a full
+      `pytest tests/` at exit 0. If step 3 chooses (c), the acceptance is the doc change that closes
+      criteria 3-5 with the client-side bound and the measurements behind it -- not a code change.
+
+Known risks for (a), stated up front because they are the ones that will bite: the paged install's
+contract is `keys`/`values` on the entry (`cache_state.py` install loop), which `QSACache` does not
+expose; `VllmMetalPagedKVCache` owns a block table while `QSACache`'s indexer streams are positional
+buffers keyed to `kv.offset`, so a conversion has to keep the two views consistent across
+`trim(n)`, speculative rollback and the bank's `state` round-trip; and the session bank stores
+snapshots of these caches, so any layout change has to survive a restore or warm prefixes will
+silently diverge (the `Desktop QA, pre-v2` failure the restore code comments describe).
+

@@ -2644,6 +2644,10 @@ class GenerationStats:
     prompt_tps: float = 0.0
     prompt_target_prefill_time_s: float = 0.0
     prompt_mtp_history_time_s: float = 0.0
+    prompt_repair_time_s: float = 0.0
+    prompt_suffix_time_s: float = 0.0
+    prompt_repage_time_s: float = 0.0
+    prompt_eval_breakdown_complete: bool = False
     prompt_target_prefill_tok_s: float = 0.0
     prompt_mtp_history_tok_s: float = 0.0
     cache_restore_time_s: float = 0.0
@@ -2998,6 +3002,50 @@ class _RepetitionStreamGate:
         return _repetition_stream_emit_limit(total, self.config, self.window)
 
 
+def _prompt_eval_time_from_parts(
+    *,
+    repair_s: float = 0.0,
+    suffix_s: float = 0.0,
+    mtp_history_s: float = 0.0,
+    repage_s: float = 0.0,
+) -> float:
+    """Compose ``prompt_eval_time_s`` from the parts measured in a prompt phase.
+
+    One place composes the aggregate so a row's breakdown always sums to it: a
+    part added here is emitted beside it, and a part dropped from the sum cannot
+    hide inside the aggregate. Before this existed the rows carried only the
+    total, which is why a 104 k follow-up costing 2.835 s for a 675-token suffix
+    could not be attributed to anything.
+    """
+    return (
+        max(0.0, float(repair_s))
+        + max(0.0, float(suffix_s))
+        + max(0.0, float(mtp_history_s))
+        + max(0.0, float(repage_s))
+    )
+
+
+def _prompt_eval_breakdown_is_complete(state: "PromptState") -> bool:
+    """True when a row's parts account for its whole ``prompt_eval_time_s``.
+
+    Only the four bank-restore paths decompose the total. A cold prompt leaves
+    every part at 0.0 while the total is the whole prefill, and without this
+    marker such a row would read as "no repair, no suffix, no repage" -- the
+    ambiguity ``prefill_attention_impl`` had before it grew a ``"none"`` versus
+    ``"unrecorded"`` distinction.
+    """
+    return (
+        abs(
+            state.prompt_repair_time_s
+            + state.prompt_suffix_time_s
+            + state.prompt_repage_time_s
+            + state.prompt_mtp_history_time_s
+            - state.prompt_eval_time_s
+        )
+        < 1e-9
+    )
+
+
 @dataclass
 class PromptState:
     trunk_cache: list[Any]
@@ -3007,6 +3055,13 @@ class PromptState:
     token_prefix: tuple[int, ...]
     prompt_eval_time_s: float
     prompt_mtp_history_time_s: float = 0.0
+    # Measured parts of prompt_eval_time_s. A path that does not decompose
+    # leaves these at 0.0, which is why the row also carries
+    # prompt_eval_breakdown_complete: 0.0 must stay distinguishable from
+    # "not measured here".
+    prompt_repair_time_s: float = 0.0
+    prompt_suffix_time_s: float = 0.0
+    prompt_repage_time_s: float = 0.0
     cache_restore_time_s: float = 0.0
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
@@ -4036,7 +4091,11 @@ def _restore_near_prefix_prompt_state(
                 hidden=hidden[:, -1:, :] if hidden is not None else None,
                 committed_mtp_cache=mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=repair_time + repage_time,
+                prompt_eval_time_s=_prompt_eval_time_from_parts(
+                    repair_s=repair_time, repage_s=repage_time
+                ),
+                prompt_repair_time_s=repair_time,
+                prompt_repage_time_s=repage_time,
                 cache_restore_time_s=total_cache_restore_time_s,
                 mtp_history_policy=mtp_history_policy,
                 cached_tokens=restore_point,
@@ -4099,8 +4158,14 @@ def _restore_near_prefix_prompt_state(
             hidden=suffix_hidden,
             committed_mtp_cache=mtp_history_cache,
             token_prefix=tuple(int(token) for token in prompt_ids),
-            prompt_eval_time_s=repair_time + suffix_time + mtp_history_time,
+            prompt_eval_time_s=_prompt_eval_time_from_parts(
+                repair_s=repair_time,
+                suffix_s=suffix_time,
+                mtp_history_s=mtp_history_time,
+            ),
             prompt_mtp_history_time_s=mtp_history_time,
+            prompt_repair_time_s=repair_time,
+            prompt_suffix_time_s=suffix_time,
             cache_restore_time_s=total_cache_restore_time_s,
             mtp_history_policy=mtp_history_policy,
             cached_tokens=restore_point,
@@ -4841,7 +4906,10 @@ def restore_or_prefill_prompt_state(
                     hidden=restored.hidden,
                     committed_mtp_cache=restored.mtp_history_cache,
                     token_prefix=tuple(int(token) for token in prompt_ids),
-                    prompt_eval_time_s=repage_time,
+                    prompt_eval_time_s=_prompt_eval_time_from_parts(
+                        repage_s=repage_time
+                    ),
+                    prompt_repage_time_s=repage_time,
                     cache_restore_time_s=restore_elapsed_s,
                     mtp_history_policy=mtp_history_policy,
                     mtp_history_window_tokens=mtp_history_window_tokens,
@@ -4915,8 +4983,11 @@ def restore_or_prefill_prompt_state(
                 hidden=suffix_hidden,
                 committed_mtp_cache=restored.mtp_history_cache,
                 token_prefix=tuple(int(token) for token in prompt_ids),
-                prompt_eval_time_s=suffix_time + mtp_history_time,
+                prompt_eval_time_s=_prompt_eval_time_from_parts(
+                    suffix_s=suffix_time, mtp_history_s=mtp_history_time
+                ),
                 prompt_mtp_history_time_s=mtp_history_time,
+                prompt_suffix_time_s=suffix_time,
                 cache_restore_time_s=restore_elapsed_s,
                 mtp_history_policy=mtp_history_policy,
                 mtp_history_window_tokens=mtp_history_window_tokens,
@@ -13521,6 +13592,12 @@ def generate_mtpk(
         ),
         prompt_target_prefill_time_s=prompt_target_prefill_time,
         prompt_mtp_history_time_s=prompt_state.prompt_mtp_history_time_s,
+        prompt_repair_time_s=prompt_state.prompt_repair_time_s,
+        prompt_suffix_time_s=prompt_state.prompt_suffix_time_s,
+        prompt_repage_time_s=prompt_state.prompt_repage_time_s,
+        prompt_eval_breakdown_complete=_prompt_eval_breakdown_is_complete(
+            prompt_state
+        ),
         cache_restore_time_s=prompt_state.cache_restore_time_s,
         prompt_target_prefill_tok_s=(
             prompt_state.suffix_tokens / prompt_target_prefill_time

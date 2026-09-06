@@ -727,6 +727,18 @@ def _row_from_output(
         "prompt_mtp_history_time_s": float(
             _stats_value(stats, "prompt_mtp_history_time_s", 0.0) or 0.0
         ),
+        "prompt_repair_time_s": float(
+            _stats_value(stats, "prompt_repair_time_s", 0.0) or 0.0
+        ),
+        "prompt_suffix_time_s": float(
+            _stats_value(stats, "prompt_suffix_time_s", 0.0) or 0.0
+        ),
+        "prompt_repage_time_s": float(
+            _stats_value(stats, "prompt_repage_time_s", 0.0) or 0.0
+        ),
+        "prompt_eval_breakdown_complete": bool(
+            _stats_value(stats, "prompt_eval_breakdown_complete", False)
+        ),
         "prompt_target_prefill_tok_s": float(
             _stats_value(stats, "prompt_target_prefill_tok_s", 0.0) or 0.0
         ),

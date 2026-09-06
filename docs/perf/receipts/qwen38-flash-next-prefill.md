@@ -345,19 +345,78 @@ Read with the cold column of the same file (7 478 → 987 tok/s; 26 727 → 910;
 - nothing is re-prefilled beyond what is counted: `generation.py:4020-4021` sets
   `cached_tokens=restore_point` and `new_prefill_tokens=len(suffix)`, so the reported cached prefix
   *is* the restore boundary and the reported new count *is* the evaluated span. A 675-token suffix
-  therefore genuinely costs 2.835 s = 238 tok/s against 386 tok/s cold at the same context — 1.6×
-  worse per token;
+  therefore genuinely costs 2.835 s = 238 tok/s. (This receipt first called that "1.6x worse per
+  token than cold at the same context"; that compared a **marginal** rate with a **cumulative
+  average**. Against the cold marginal cost of the same band the ratio is 1.065 -- see "The prompt
+  phase now reports its parts" below, which is where the correction comes from.);
 - a withdrawn hypothesis, recorded so it is not re-derived: an O(sessions) scan at
   `session_bank.py:1746` via `get_session` → `_prune_locked`. Neither symbol exists in that file and
   line 1746 is the boundary-true restore path. The scans that do exist (`_active_session_ids` over
   `_session_last_active.items()`, `_entries.items()` in the restore/candidate paths) are host-side
   over maps with a handful of entries — orders of magnitude too small for 2.8 s.
 
-So D1 and D2 are one curve: per-token cost grows with retained context on the stock attention path,
-and a follow-up samples it at the worst shape — a narrow q (675) against the whole retained KV, the
-least compute per byte of KV read. Attributing the 2.835 s further needs an instrument that does not
-exist yet: rows carry `prompt_target_prefill_time_s` (the whole prompt eval, `generation.py:7273`)
-and nothing finer, and the owned cache's `attention_time_s` cannot apply here because the owned
-subsystem is never wired (gates 1–2 above). Next instrument, if D1 is attacked before the curve
-itself: a per-phase timer inside prompt eval.
+So D1 and D2 are one curve -- and the instrument built an hour later says so with numbers instead of
+arguing from shape. The follow-up's per-token cost is 1.065x the cold **marginal** cost of the same
+context band, and it does not improve when the suffix is made wider, so the cost is set by the
+context a request sits at rather than by the narrow-q shape this receipt first suspected. The
+breakdown that established both is the next section.
+
+## The prompt phase now reports its parts, and the parts close D1 (2026-09-06 23:05)
+
+Instrument: `_prompt_eval_time_from_parts` and `_prompt_eval_breakdown_is_complete` in
+`mtplx/generation.py`; four new row keys (`prompt_repair_time_s`, `prompt_suffix_time_s`,
+`prompt_repage_time_s`, `prompt_eval_breakdown_complete`) plus `prompt_mtp_history_time_s`, which the
+request-log row was missing while the public projection already had it. One place composes the
+aggregate, so a part cannot enter the total without being emitted beside it, and the completeness
+flag keeps a `0.0` part from reading as "nothing happened" on a path that never decomposed -- the
+same `none` versus `unrecorded` distinction the lane fields needed.
+`tests/test_prompt_eval_breakdown.py` (7 cases); the 15 request-observability goldens regenerated
+with **60 additions, 0 removals, 0 changed values**.
+
+Live on the side-by-side 9003 running the repo build (9001/9002 left untouched, both 200 before and
+after):
+
+| row | cached | new | prompt_eval_s | suffix | mtp_history | repair | repage | complete |
+|---|---|---|---|---|---|---|---|---|
+| cold 7 847 | 0 | 7 847 | 8.034 | 0.0 | 0.2158 | 0.0 | 0.0 | **False** |
+| follow-up 8 515 | 7 840 | 675 | 1.1881 | **1.1235** | 0.0342 | 0.0305 | 0.0 | **True** |
+| follow-up 102 030 | 101 355 | 675 | 2.7975 | **2.7687** | 0.0 | 0.0288 | 0.0 | **True** |
+
+The 102 k follow-up is **99.0 % suffix prefill** -- repair 1.0 %, repage nothing -- and the bank
+restore (0.481 s) sits outside `prompt_eval_time_s` entirely. So the follow-up cost is not restore
+bookkeeping, not the one-token repair forward, and not repaging: it is the same attention work a cold
+prefill does, at the context the request sits at.
+
+Marginal versus average, the comparison that settles it (cold rows from the 9001 baseline):
+
+| cold rung | ms/token, cumulative average | ms/token, marginal to the previous rung |
+|---|---|---|
+| 7 478 | 1.0135 | -- |
+| 26 727 | 1.0984 | 1.1314 |
+| 52 389 | 1.3560 | 1.6244 |
+| 103 714 | 2.5902 | **3.8499** |
+
+| measurement | ms per new token | / top-band marginal |
+|---|---|---|
+| follow-up, 675 new at 101 355 cached (today, 9003) | 4.1018 | **1.065** |
+| follow-up, 675 new at 103 707 cached (baseline, 9001) | 4.1996 | 1.091 |
+| suffix-width sweep, 7 220-9 006 new at 94 208 cached | 4.448-4.853 | 1.155-1.261 |
+
+Two conclusions:
+
+1. **A follow-up pays the cold curve's marginal cost at its own context, within 6-9 %.** There is no
+   separate restored-cache penalty to hunt, so the prefill issue's criteria 3 and 4 are one fix
+   rather than two: halve the marginal cost of long-context attention and the 103 k cold prefill and
+   the 103 k follow-up move together.
+2. **Suffix width is not the lever.** The sweep asked for suffixes of 64 to 4 096 tokens; the bank
+   matched a trimmed prefix (94 208 cached instead of 101 355), so the real suffixes were
+   7 220-9 006 tokens, and per-token cost stayed flat across them. A narrow-q arithmetic-intensity
+   story would have improved as the suffix widened; it did not. Recorded with its confound rather
+   than re-run, because the flatness is the part that carries:
+   `~/.mtplx/scripts/d1-suffix-width-sweep.py`, rows in `~/.mtplx/logs/request-log-9003.jsonl`.
+
+Swap note bearing on criterion 7 of the prefill issue: 72.56 MiB with the 9001+9002 pair,
+**139.75 MiB** while the temporary third pack (9003) was resident -- above the pair's 128 MiB bound.
+The criterion is written for the pair; a third Flash-Next pack is outside its scope, and the reading
+is recorded here rather than left in a shell scrollback.
 

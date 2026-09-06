@@ -19040,6 +19040,18 @@ def _generation_truth_stats(
 # Keys copied from per-request stats into the request-log envelope. Hoisted out of the
 # request handler so a key that stops reaching the JSONL row fails a unit test instead of
 # surfacing only after booting a 115 GB server.
+# The prompt phase's measured parts. Rows carry the total
+# (`prompt_eval_time_s`) everywhere, but only the four restore paths decompose
+# it; `prompt_eval_breakdown_complete` says which kind of row this is, so a
+# 0.0 part is never read as "nothing happened" on a path that never measured.
+REQUEST_ENVELOPE_PROMPT_BREAKDOWN_KEYS = (
+    "prompt_mtp_history_time_s",
+    "prompt_repair_time_s",
+    "prompt_suffix_time_s",
+    "prompt_repage_time_s",
+    "prompt_eval_breakdown_complete",
+)
+
 REQUEST_ENVELOPE_LANE_KEYS = (
     "paged_kv_capacity_tokens",
     "paged_kv_num_blocks",
@@ -19163,6 +19175,10 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "cache_restore_time_s",
     "prompt_target_prefill_time_s",
     "prompt_mtp_history_time_s",
+    "prompt_repair_time_s",
+    "prompt_suffix_time_s",
+    "prompt_repage_time_s",
+    "prompt_eval_breakdown_complete",
     "prompt_target_prefill_tok_s",
     "prompt_mtp_history_tok_s",
     "prompt_tps",
@@ -24400,7 +24416,9 @@ def _run_generation(
         envelope["dynamic_paged_kv"] = {
             key: value for key, value in dynamic_kv_reservation.items() if key != "env"
         }
-        for key in REQUEST_ENVELOPE_LANE_KEYS:
+        for key in (
+            REQUEST_ENVELOPE_LANE_KEYS + REQUEST_ENVELOPE_PROMPT_BREAKDOWN_KEYS
+        ):
             if key in stats:
                 envelope[key] = stats[key]
         envelope["generation_mode"] = effective_mode
