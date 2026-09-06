@@ -400,7 +400,11 @@ the guard and hand the compiled core `None`.
       `qwen4_exp` now resolves the class at call time. Side effect worth noting: until this change,
       this family's GDN caches were **stock** `ArraysCache` instances in the ladder path, i.e.
       without the deferred-advance bookkeeping that the vendored class exists to add.
-- [ ] **Root cause 2 — still open, and it is a design call.** With identity fixed, the same 48-layer
+- [x] **Root cause 2 — CLOSED as not a blocker; the prediction below was wrong and stays on
+      record.** By the time the ladder builds the spec, the `ple` leaves are already written: a probe
+      over the real pack reported the spec ACCEPTED with `entries=48 total None leaves=0`, including
+      the size-4 cache at layer 1, and the ladder's remaining failure was the verify-strategy
+      mismatch fixed in `98d5c52`. So this never gated the ladder. With identity fixed, the same 48-layer
       cache list (36 GDN, one of them `ple`, 12 QSA) is now refused for the *other* reason:
       `unsupported_container:ArraysCache[partial_ple]` — `make_cache()` gives `ple` layers a
       size-4 cache whose leaves are all `None` until the first write, and the guard requires four
@@ -408,8 +412,9 @@ the guard and hand the compiled core `None`.
       teach the fixed-M4 core an unwritten `ple` slot. Relaxing the guard is not an option: it
       would hand the compiled verifier `None` where it expects arrays, and the two-leaf case
       already accepts a `None` slot (`tests/test_graphbank_verify_state_spec.py` pins the
-      asymmetry). This is upstream-shaped code, so it deserves a report to the author rather than
-      a local patch in the same commit as the identity fix.
+      asymmetry). **Standing instruction, supersedes the wording above:** nothing in this tree gets
+      routed to the upstream author. Their PRs sit unreviewed for months, so the fork owns and
+      documents these fixes locally. Do not propose filing issues or PRs upstream.
 
 
 ### Task 4 — D3 geometry constant per architecture
@@ -459,15 +464,29 @@ the only tool that can drive *my own* wrappers' ports with a per-port session ba
 
 
 
-- [ ] **Step 1:** fix the crash independent of the harness: guard the `layer.input_layernorm`
-      sites in `gdn_capture.py` (`:2892`, `:2948`, `:3033`) behind the arch's real attribute
-      names, with a failing test using a `qwen4_exp`-shaped fake whose layers lack
-      `input_layernorm`. This is the one defect with a clean unit seam, so do it first.
-- [ ] **Step 2:** add `--url`/`--port` (or `--harness serve`) to `prefill_bench.py` so the ladder
-      drives a live server; the ladder's numbers must then match a probe run within noise.
-- [ ] **Step 3:** delete the external `prefill-probe.py` dependency by porting its row-kind logic
-      (`kind` derived from `cached_tokens`, never assumed) into the ladder's JSON.
-- [ ] **Step 4:** commit.
+- [x] **Step 1 (shipped 2026-09-06, differently from written):** the defect is real and the seam is
+      clean, but guarding three attribute lookups would have left the ladder on a lane the product
+      never runs. What shipped instead: `generic_hybrid_capture_blocker()` + a named `RuntimeError`
+      in `runtime.forward_ar_capture` (`b742b8c`), the family verify-lane override in
+      `prefill_bench` (`b742b8c`), then the actual unblock -- reusing the server's own family rule so
+      qwen4_exp verifies `batched` and rides `MTPLX_FAMILY_CAPTURE_COMMIT` (`98d5c52`,
+      `tests/test_qwen4_family_verify_strategy.py`, `tests/test_qwen4_capture_lane.py`). Live
+      result: the ladder completes 2048 and 131072 in one run.
+- [x] **Step 2 (shipped as `--harness direct-http`, `a04460d`):** no new flag was invented -- the
+      existing `--url/--port` pair selects the harness, so the ladder measures a live server. The
+      noise condition held (the harness reproduced the probe's rate on the same prompt inside the
+      measured 0.43 % cold spread) and it exposed two facts that changed the plan: the session bank
+      survives `mtplx stop`, so a cold row needs a fresh server or an emptied bank; and the engine
+      will not answer `gen_config` unless the served id matches `--model-id`, which is why the
+      side-by-side port had to name itself `mtplx-flash-next`.
+- [ ] **Step 3 (still open, and now more expensive to close):** the ladder rows do carry
+      `cached_tokens`/`new_prefill_tokens`, so the `kind` derivation could be ported -- but the
+      external tool has become load-bearing rather than incidental: `prefill-probe.py` is what reads
+      engine rows out of `~/.mtplx/logs/request-log-<port>.jsonl`, and the 2026-09-06 lane sweep
+      (`~/.mtplx/scripts/prefill-lane-sweep.py`) is built on exactly that channel to read
+      `prefill_layout`/`prefill_attention_impl` per cold row. Either port the engine-row reader into
+      `prefill_bench` too, or drop this box and keep the two tools deliberately separate.
+- [x] **Step 4:** committed with the harness work (`a04460d`) and the receipt updates (`98f8604`).
 
 ### Task 6 — D5 honest reporting
 

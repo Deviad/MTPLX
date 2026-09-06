@@ -71,8 +71,11 @@ def _installed_arrays_cache():
     object instead, so caches built here were instances of a different class than the
     one ``graphbank.build_verify_state_spec`` isinstance-checks at call time. That
     arrived as ``unsupported_container:ArraysCache`` and killed the prefill ladder's
-    fixed-M4 lane -- and, less loudly, meant this family's GDN caches kept the
-    deferred-advance leak the vendored class exists to close.
+    fixed-M4 lane -- and, less loudly, an import-order trap: whenever this module bound
+    the name before the install ran (which is what the in-process ladder did), this family's
+    GDN caches were stock objects without the deferred-advance bookkeeping. The served path
+    measured clean: importing mtplx.server.openai installs the vendored cache before this module
+    is first imported, so qwen4_exp bound the fixed class there.
     """
     from mlx_lm.models.cache import ArraysCache
 
