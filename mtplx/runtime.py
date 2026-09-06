@@ -296,7 +296,24 @@ class MTPLXRuntime:
             logits = self.forward_ar(input_ids, cache=cache)
             return logits, {}
 
-        from .gdn_capture import forward_with_gdn_capture
+        from .gdn_capture import (
+            forward_with_gdn_capture,
+            generic_hybrid_capture_blocker,
+        )
+        from .qwen4_fixed_verify import QWEN4_FIXED_M4_VERIFY_ENV
+
+        blocker = generic_hybrid_capture_blocker(self.model)
+        if blocker is not None:
+            inner = getattr(getattr(self.model, "language_model", self.model), "model", None)
+            model_type = str(getattr(getattr(inner, "args", None), "model_type", "") or "")
+            raise RuntimeError(
+                "generic GDN capture requires the qwen3_5/laguna layer vocabulary "
+                f"(missing {blocker!r} on a layer of model_type={model_type or 'unknown'}); "
+                "this trunk needs its own verify lane installed instead. For qwen4_exp "
+                f"(Qwen3.8 Flash-Next) that is {QWEN4_FIXED_M4_VERIFY_ENV}=1, which the "
+                "server resolves from the pack config and the prefill ladder now sets; "
+                "measuring without it would benchmark a lane the product never runs."
+            )
 
         return forward_with_gdn_capture(
             self.model,

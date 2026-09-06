@@ -74,8 +74,11 @@ def is_qwen4_fixed_verify_config(config: dict[str, Any]) -> bool:
     )
 
 
+QWEN4_FIXED_M4_VERIFY_ENV = "MTPLX_QWEN4_FIXED_M4_VERIFY"
+
+
 def qwen4_fixed_verify_enabled() -> bool:
-    raw = os.environ.get("MTPLX_QWEN4_FIXED_M4_VERIFY", "0").strip().lower()
+    raw = os.environ.get(QWEN4_FIXED_M4_VERIFY_ENV, "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

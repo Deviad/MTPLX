@@ -19,6 +19,7 @@ from .profiles import DEFAULT_PROFILE_NAME, apply_profile_env, get_profile
 
 DEFAULT_CONTEXTS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
 FULL_CONTEXTS = DEFAULT_CONTEXTS + (65536, 131072)
+QWEN4_ENV_KEY = "MTPLX_QWEN4_FIXED_M4_VERIFY"
 DEFAULT_PROMPT_STYLE = "coding-agent"
 LEGACY_PROMPT_STYLE = "legacy-repeat"
 PROMPT_STYLE_CHOICES = (DEFAULT_PROMPT_STYLE, LEGACY_PROMPT_STYLE)
@@ -847,6 +848,34 @@ def _ladder_profile(args: Any) -> Any:
     return get_profile(_resolved_default_profile_name(args))
 
 
+def _apply_family_verify_lane_override(model: str) -> str | None:
+    """Install the verify lane the pack's own family requires, if any.
+
+    ``server/openai.py`` resolves the qwen4 lane env from the pack's ``config.json``;
+    the ladder built its environment from the profile alone, so a ``qwen4_exp`` trunk
+    reached the generic hybrid capture — written for the qwen3_5 layer vocabulary — and
+    died inside the first captured forward with an ``AttributeError`` that read as
+    damaged model code. Keyed on ``model_type`` because this family rides the generic
+    ``native_mtp`` descriptor, not its own. Operator env still wins: this is a
+    ``setdefault``, so a deliberately disabled lane stays disabled.
+
+    Returns the value now in effect, or ``None`` when no lane applies (including a
+    bare HF id or a directory without ``config.json``, which is not an error here).
+    """
+
+    from .qwen4_fixed_verify import QWEN4_FIXED_M4_VERIFY_ENV
+
+    config_path = Path(str(model)).expanduser() / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if str(config.get("model_type") or "") != "qwen4_exp":
+        return None
+    os.environ.setdefault(QWEN4_FIXED_M4_VERIFY_ENV, "1")
+    return os.environ[QWEN4_FIXED_M4_VERIFY_ENV]
+
+
 def run_prefill_ladder(args: Any) -> dict[str, Any]:
     contexts = parse_contexts(getattr(args, "contexts", None), full=bool(getattr(args, "full", False)))
     profile = _ladder_profile(args)
@@ -1041,6 +1070,9 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
         return payload
 
     apply_profile_env(profile.name)
+    family_verify_lane = _apply_family_verify_lane_override(model)
+    if family_verify_lane:
+        payload["family_verify_lane"] = {QWEN4_ENV_KEY: family_verify_lane}
     _apply_prefill_layout_override(prefill_layout)
     paged_attn_impl = _apply_paged_attention_impl_override(args)
     mtp_history_policy = _apply_mtp_history_policy_override(args)

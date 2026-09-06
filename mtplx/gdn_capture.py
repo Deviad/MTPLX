@@ -2995,6 +2995,26 @@ def _fused_post_norm_tg_override() -> int | None:
     return value if value > 0 else None
 
 
+def generic_hybrid_capture_blocker(model: Any) -> str | None:
+    """Return the layer attribute this trunk lacks for the generic capture, else ``None``.
+
+    ``forward_with_gdn_capture`` walks ``inner.layers`` on the qwen3_5/laguna layer
+    vocabulary. A trunk that names its norms differently reaches it only when its own
+    verify lane was never installed, and fails deep inside a captured forward with an
+    ``AttributeError`` that reads as damaged model code. Naming the attribute here lets
+    the dispatch report the lane to install instead.
+    """
+
+    text_model = getattr(model, "language_model", model)
+    inner = getattr(text_model, "model", None)
+    layers = getattr(inner, "layers", None) or ()
+    for layer in layers:
+        for attribute in ("input_layernorm", "post_attention_layernorm"):
+            if not hasattr(layer, attribute):
+                return attribute
+    return None
+
+
 def forward_with_gdn_capture(
     model: Any,
     inputs: mx.array,
