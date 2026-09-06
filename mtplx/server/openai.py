@@ -19035,6 +19035,54 @@ def _generation_truth_stats(
     }
 
 
+# Keys copied from per-request stats into the request-log envelope. Hoisted out of the
+# request handler so a key that stops reaching the JSONL row fails a unit test instead of
+# surfacing only after booting a 115 GB server.
+REQUEST_ENVELOPE_LANE_KEYS = (
+    "paged_kv_capacity_tokens",
+    "paged_kv_num_blocks",
+    "paged_active_array_calls",
+    "paged_active_array_time_s",
+    "paged_turboquant",
+    "paged_turboquant_k_quant",
+    "paged_turboquant_v_quant",
+    "paged_turboquant_attention_calls",
+    "paged_kv_quant",
+    "paged_kv_quant_mode",
+    "paged_kv_quant_attention_calls",
+    "paged_kv_quant_dequant_calls",
+    "paged_kv_quant_dequant_time_s",
+    "paged_kv_quant_dequant_tokens",
+    "paged_kv_quant_dequant_memo_hits",
+    "paged_kv_quant_dequant_memo_rebuilds",
+    "paged_kv_quant_kernel_calls",
+    "paged_gqa_sdpa_calls",
+    "paged_gqa_sdpa_calls_by_route",
+    "paged_gqa_sdpa_calls_by_phase",
+    "paged_gqa_sdpa_route_misses_by_phase_reason",
+    "paged_gqa_sdpa_route_misses_by_q_len",
+    "paged_gqa_sdpa_last_route_miss",
+    "attention_dense_fallback_calls",
+    "prefill_dense_fallback_calls",
+    "decode_dense_fallback_calls",
+    "ar_dense_fallback_calls",
+    "postcommit_dense_fallback_calls",
+    "paged_attention_bailouts_by_phase_reason",
+    "paged_attention_large_q_path",
+    "prefill_route",
+    "prefill_layout",
+    "prefill_attention_impl",
+    "large_q_split_sdpa_fallback_calls",
+    "large_q_split_sdpa_fallback_calls_by_phase",
+    "prefill_large_q_split_sdpa_fallback_calls",
+    "decode_large_q_split_sdpa_fallback_calls",
+    "partitioned_paged_calls",
+    "partitioned_paged_calls_by_phase",
+    "prefill_partitioned_paged_calls",
+    "decode_partitioned_paged_calls",
+)
+
+
 PUBLIC_MTPLX_STATS_KEYS = (
     "mode",
     "profile",
@@ -19097,6 +19145,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "hardware_acceleration_eligible",
     "hardware_acceleration_confirmed",
     "prefill_route",
+    "prefill_attention_impl",
+    "prefill_layout",
     "generation_mode",
     "generated_tokens",
     "prompt_tokens",
@@ -24348,46 +24398,7 @@ def _run_generation(
         envelope["dynamic_paged_kv"] = {
             key: value for key, value in dynamic_kv_reservation.items() if key != "env"
         }
-        for key in (
-            "paged_kv_capacity_tokens",
-            "paged_kv_num_blocks",
-            "paged_active_array_calls",
-            "paged_active_array_time_s",
-            "paged_turboquant",
-            "paged_turboquant_k_quant",
-            "paged_turboquant_v_quant",
-            "paged_turboquant_attention_calls",
-            "paged_kv_quant",
-            "paged_kv_quant_mode",
-            "paged_kv_quant_attention_calls",
-            "paged_kv_quant_dequant_calls",
-            "paged_kv_quant_dequant_time_s",
-            "paged_kv_quant_dequant_tokens",
-            "paged_kv_quant_dequant_memo_hits",
-            "paged_kv_quant_dequant_memo_rebuilds",
-            "paged_kv_quant_kernel_calls",
-            "paged_gqa_sdpa_calls",
-            "paged_gqa_sdpa_calls_by_route",
-            "paged_gqa_sdpa_calls_by_phase",
-            "paged_gqa_sdpa_route_misses_by_phase_reason",
-            "paged_gqa_sdpa_route_misses_by_q_len",
-            "paged_gqa_sdpa_last_route_miss",
-            "attention_dense_fallback_calls",
-            "prefill_dense_fallback_calls",
-            "decode_dense_fallback_calls",
-            "ar_dense_fallback_calls",
-            "postcommit_dense_fallback_calls",
-            "paged_attention_bailouts_by_phase_reason",
-            "paged_attention_large_q_path",
-            "large_q_split_sdpa_fallback_calls",
-            "large_q_split_sdpa_fallback_calls_by_phase",
-            "prefill_large_q_split_sdpa_fallback_calls",
-            "decode_large_q_split_sdpa_fallback_calls",
-            "partitioned_paged_calls",
-            "partitioned_paged_calls_by_phase",
-            "prefill_partitioned_paged_calls",
-            "decode_partitioned_paged_calls",
-        ):
+        for key in REQUEST_ENVELOPE_LANE_KEYS:
             if key in stats:
                 envelope[key] = stats[key]
         envelope["generation_mode"] = effective_mode

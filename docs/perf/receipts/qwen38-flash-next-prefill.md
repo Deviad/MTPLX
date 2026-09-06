@@ -222,3 +222,70 @@ What the sweep could not observe: the request rows for this family carry no
 `prefill_layout` / `prefill_attention_impl` keys at all, so "the lane was not chosen" is known
 from absent counters, not from a positive statement of what ran. That gap is Task 3 step 1 and
 it is now the critical path — see the handoff.
+
+## Task 3 step 1 shipped, and the lane sweep that it made possible
+
+2026-09-06 18:47–19:05. `scripts/install_repo_launcher.sh` sibling work aside, this is the
+instrumentation slice: the engine row now carries `prefill_layout` and `prefill_attention_impl`.
+
+**What was missing and why the old rows could not answer.** `PUBLIC_MTPLX_STATS_KEYS` already
+listed `prefill_route`, but the request-log envelope copies a *different*, inline key set inside the
+request handler, so the field never reached `request-log-<port>.jsonl`. That is why the 16:36 sweep
+read four lane counters as 0: the keys were present as **dataclass defaults**, not as measurements.
+The new `prefill_attention_impl` distinguishes the two by construction — `"none"` means the lane
+accounting ran and no lane fired, `"unrecorded"` means the request never reached it.
+
+Proof on the live engine (fresh repo-build server, 8k probe, one request each):
+
+| braccio | `prefill_layout` | `prefill_attention_impl` |
+|---|---|---|
+| auto | `contiguous_dense_decode` | `none` |
+| `MTPLX_SUSTAINED_PREFILL_LAYOUT=contiguous_then_repage` | `contiguous_then_repage` | `none` |
+
+The field discriminates, so it reads the executed path rather than the requested one.
+
+## Lane sweep — the ceiling changes the executed layout and costs nothing measurable
+
+`~/.mtplx/scripts/prefill-lane-sweep.py --rounds 3`, repo build on 9003, one fresh server per arm,
+session bank emptied per arm, identical prompt bytes (fixed probe tag), **51,395 tokens** per row,
+9/9 rows without error. Rate = engine `prompt_eval_time_s`.
+
+| braccio | n | media tok/s | spread intra-braccio | layout eseguito |
+|---|---|---|---|---|
+| auto | 3 | 744,9 | 1,61 % | `contiguous_dense_decode` |
+| ceiling 32768 | 3 | 742,6 | 0,94 % | `contiguous_then_repage` |
+| forced repage | 3 | 741,8 | 0,58 % | `contiguous_then_repage` |
+
+ceiling vs auto **−0,30 %**, repage vs auto **−0,41 %**, repage vs ceiling **−0,11 %** — every delta
+under the largest within-arm spread (1,61 %), so no speed effect is claimed either way. The new
+result is the **why**: at this context the ceiling really does flip the executed layout
+(`dense_decode` → `then_repage`), and the flip is free. `prefill_attention_impl` is `none` in all 9
+rows, so neither layout engages a counted prefill lane for this family — which is the same shape of
+finding as arm D's "the paged lane was never taken", now stated positively instead of inferred from
+absent keys.
+
+**Not comparable to the 16:36 numbers.** That sweep matched 62,908 new tokens; this one is 51,395.
+Rates differ by ~11 % between the two context sizes, and size is a confound, exactly as in §12:
+compare arms inside one sweep, never across sweeps.
+
+## D3 / ladder in-process: the real blocker is a fresh ple cache, not a missing adapter
+
+Measured with `build_verify_state_spec` on synthetic caches (no weights loaded):
+
+| cache | esito |
+|---|---|
+| `ArraysCache(2)` | accettata, `(0, gdn, 2)` |
+| `ArraysCache(4)` **appena costruita** | rifiutata: `unsupported_container:ArraysCache[partial_ple]` |
+| `ArraysCache(4)` con una foglia `None` | rifiutata, stessa ragione |
+| `ArraysCache(1)` / `ArraysCache(3)` | `unsupported_container:ArraysCache[1]` / `[3]` |
+| `ArraysCache(2)` con foglia `None` | **accettata** |
+| `FixedArraysCache(2)` (vendored) | accettata |
+
+`qwen4_exp.make_cache()` (`models/qwen4_exp.py:5412-5422`) puts `ArraysCache(size=4)` on every
+`"ple"` layer, and a new one has all four leaves `None` until the first write. So the ladder reaches
+the spec builder holding caches that are *young*, not corrupt, and one such entry poisons the whole
+layer list (`tests/test_graphbank_verify_state_spec.py::test_one_bad_entry_poisons_the_whole_layer_list`).
+The hard failure, as opposed to an eager fallback, comes from the fixed-M4 verify lane that D4
+switched on for this family. Pinning the asymmetry (a two-leaf `None` is fine, a four-leaf one is
+not) is the deliberate part: the fix must populate or defer those leaves, not relax the guard and
+hand the compiled core `None`.

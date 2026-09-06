@@ -789,6 +789,10 @@ def _row_from_output(
             _stats_value(stats, "paged_attention_large_q_path", "") or ""
         ),
         "prefill_route": str(_stats_value(stats, "prefill_route", "") or ""),
+        "prefill_attention_impl": str(
+            _stats_value(stats, "prefill_attention_impl", "unrecorded") or "unrecorded"
+        ),
+        "prefill_layout": str(_stats_value(stats, "prefill_layout", "") or ""),
         "paged_attention_bailouts_by_phase_reason": dict(
             _stats_value(stats, "paged_attention_bailouts_by_phase_reason", {}) or {}
         ),
@@ -1160,6 +1164,11 @@ def _run_prefill_ladder_against_server(
         )
         row.update(build.metadata)
         row["requested_prefill_layout"] = payload.get("prefill_layout", {}).get("requested")
+        # The engine names these two only in its own per-request row (see
+        # PUBLIC_MTPLX_STATS_KEYS), which the serve harness cannot read over HTTP.
+        # Keys stay present as null so a sweep can tell "serve mode" from "no row".
+        row["prefill_attention_impl"] = None
+        row["prefill_layout"] = None
         payload["rows"].append(row)
     # The layout sweep this key would carry is an in-process knob; in serve mode the
     # server under test owns it, so the key stays present and empty rather than absent

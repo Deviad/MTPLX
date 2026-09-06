@@ -987,6 +987,44 @@ def _runtime_counter_delta(
     }
 
 
+# The prefill counters say *that* a kernel ran. A sweep needs the row to say
+# *which* lane served prefill without re-deriving it from five keys, and it needs
+# "no lane ran" to be a value rather than a missing field -- an absent counter set
+# and an empty one are different evidence.
+PREFILL_LANES: tuple[tuple[str, Any], ...] = (
+    ("partitioned_paged", lambda s: s.prefill_partitioned_paged_calls),
+    (
+        "paged_gqa_sdpa",
+        lambda s: int((s.paged_gqa_sdpa_calls_by_phase or {}).get("prefill") or 0),
+    ),
+    ("dense_fallback", lambda s: s.prefill_dense_fallback_calls),
+    ("large_q_split_sdpa_fallback", lambda s: s.prefill_large_q_split_sdpa_fallback_calls),
+)
+PREFILL_IMPL_NONE = "none"
+# Deliberately distinct from PREFILL_IMPL_NONE: "none" is a measurement (the lane
+# accounting ran and nothing fired), "unrecorded" means this request never reached
+# that accounting -- which for served qwen4_exp rows is what happens while owned
+# attention is off. A sweep must be able to tell those two apart.
+PREFILL_IMPL_UNRECORDED = "unrecorded"
+
+
+def derive_prefill_attention_impl(stats: "GenerationStats") -> str:
+    """Name the prefill lanes that recorded work, with call counts, or "none".
+
+    Every lane that fired is reported, not just the first: two lanes sharing one
+    prefill is a finding, and a single-lane answer would hide it.
+    """
+    fired = []
+    for name, count_of in PREFILL_LANES:
+        try:
+            count = int(count_of(stats) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            fired.append(f"{name}:{count}")
+    return ",".join(fired) if fired else PREFILL_IMPL_NONE
+
+
 def _attach_runtime_diagnostics(
     stats: "GenerationStats",
     rt: MTPLXRuntime,
@@ -1012,6 +1050,11 @@ def _attach_runtime_diagnostics(
     )
     stats.logits_tokens_emitted = int(counters.get("logits_tokens_emitted", 0))
     stats.prefill_chunks = int(counters.get("prefill_chunks", 0))
+    # Layout is decided from env plus the per-request context (set before prefill at
+    # generation.py:163), so it is knowable here even when the owned-attention block
+    # below bails out. The lane counters are not knowable in that case, which is why
+    # prefill_attention_impl keeps its "unrecorded" default instead of claiming "none".
+    stats.prefill_layout = _sustained_prefill_layout()
     stats.prefill_chunk_size = _prefill_chunk_size()
     stats.prefill_chunk_cache_cleanup_enabled = _prefill_chunk_cache_cleanup_enabled()
     stats.prefill_chunk_cache_cleanup_every = _prefill_chunk_cache_cleanup_every()
@@ -1138,6 +1181,11 @@ def _attach_runtime_diagnostics(
     stats.decode_partitioned_paged_calls = int(
         owned_attn.get("decode_partitioned_paged_calls") or 0
     )
+    stats.prefill_attention_impl = derive_prefill_attention_impl(stats)
+    # ``prefill_route`` is this module's name for the layout that served prefill; the
+    # engine row and the probe call it ``prefill_layout``, so a bench row's
+    # ``requested_prefill_layout`` can be read against what executed.
+    stats.prefill_layout = stats.prefill_route or stats.prefill_layout
 
 
 def _sustained_prefill_enabled() -> bool:
@@ -2543,6 +2591,8 @@ class GenerationStats:
     )
     paged_attention_large_q_path: str = ""
     prefill_route: str = ""
+    prefill_attention_impl: str = PREFILL_IMPL_UNRECORDED
+    prefill_layout: str = ""
     large_q_split_sdpa_fallback_calls: int = 0
     large_q_split_sdpa_fallback_calls_by_phase: dict[str, int] = field(
         default_factory=dict

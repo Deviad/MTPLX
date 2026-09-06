@@ -337,20 +337,50 @@ whether the lane is unreachable, or every further sweep stays unfalsifiable.
 
 ### Task 3 — D2 paged lane: make it fire, then make it provable
 
-- [ ] **Step 1:** instrument first — emit `prefill_attention_impl` and `prefill_layout` on every
+- [x] **Step 1:** instrument first — emit `prefill_attention_impl` and `prefill_layout` on every
       request row, not just chunked ones (they are absent today, which made this hunt slow).
+      **Done 2026-09-06.** `generation.py` derives the lane name from the prefill-phase counters
+      (`derive_prefill_attention_impl`) and copies the executed layout into `prefill_layout`;
+      `openai.py`'s envelope key set — hoisted to `REQUEST_ENVELOPE_LANE_KEYS` so a dropped key
+      fails a unit test instead of surfacing only after a 115 GB boot — carries both to the
+      request-log row. Proof: live 8k probe reads `contiguous_dense_decode` vs
+      `contiguous_then_repage` across two arms (`tests/test_prefill_attention_impl.py`, 9 cases),
+      and the field distinguishes `"none"` (accounting ran, no lane fired) from `"unrecorded"`
+      (never reached it) — the distinction the 16:36 sweep lacked when it read four counters as 0.
 - [ ] **Step 2:** new `tests/test_qwen4_prefill_lane.py`: with a fake `qwen4_exp` layer set, assert
       the counter at `generation.py:1069` becomes non-zero past the ceiling. If no unit-level seam
-      exists, that absence is itself the finding — add the seam.
-- [ ] **Step 3:** sweep the lane from the *serve* harness, not the in-process one. On a fresh
-      server with an empty bank, run the matched-size pair (62–65 k new tokens) once per
-      `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` value (auto, 65536, 32768, 16384) and record
-      tok/s + counter per arm against the 657,9 tok/s cold reference. Arm D (in-process, ceiling
-      32768) measured 267.003 s vs 267.920 s, i.e. inside the 0,43 % noise. Expected from
-      `profiles.py:525`: repaging loses decode. If nothing ever makes the counter non-zero, the
-      lane is unreachable for `qwen4_exp` and that is the answer — write it into `docs/perf/`
-      rather than leaving it implied.
-- [ ] **Step 4:** commit the sweep table even if the result is negative.
+      exists, that absence is itself the finding — add the seam. **Still the blocker on the word
+      "unreachable"**: step 1 proved no counted lane fires under either layout, but only a seam can
+      tell "the code path never reaches the paged kernels" from "the kernels run and are not
+      counted".
+- [x] **Step 3:** sweep the lane from the *serve* harness, not the in-process one. **Partly done
+      2026-09-06, and re-scoped:** `~/.mtplx/scripts/prefill-lane-sweep.py` ran three arms
+      (auto / ceiling 32768 / forced repage) × three interleaved rounds at **51,395** tokens on a
+      fresh server with an emptied bank. Result in the receipt: deltas −0,30 % / −0,41 % / −0,11 %
+      against a 1,61 % within-arm spread — no speed effect — and the ceiling is now *seen* flipping
+      the executed layout, which the four-value 62,908-token version could not show. The
+      16,384/65,536 values were not re-run; they are unnecessary unless step 2 shows a lane that
+      could care.
+- [x] **Step 4:** commit the sweep table even if the result is negative. **Done** with the step 1
+      commit (receipt sections above).
+
+### Ladder in-process (Task 5 step 3) — the blocker is a fresh `ple` cache, not a missing adapter
+
+Measured on synthetic caches, no weights: `build_verify_state_spec` accepts `ArraysCache(2)` but
+rejects a **newly constructed** `ArraysCache(4)` as
+`unsupported_container:ArraysCache[partial_ple]`, because all four leaves are `None` until the
+first write. `qwen4_exp.make_cache()` (`models/qwen4_exp.py:5412-5422`) puts a size-4 cache on
+every `"ple"` layer, and one such entry poisons the whole layer list. Pinned in
+`tests/test_graphbank_verify_state_spec.py` (7 cases), including the asymmetry that a two-leaf
+`None` *is* accepted — which is why the fix must populate or defer the leaves rather than relax
+the guard and hand the compiled core `None`.
+
+- [ ] **Confirm by run, not inference:** the eager-vs-fatal step is believed to come from the
+      fixed-M4 verify lane that D4 switched on for this family. The falsification is one in-process
+      ladder run with `MTPLX_QWEN4_FIXED_M4_VERIFY=0` at a small context. Not run yet: the ladder
+      loads the model in-process and must not overlap a server holding the same weights
+      (`prefill-ladder-baseline.sh` header), so it needs 9001 and 9002 stopped for ~4 minutes.
+
 
 ### Task 4 — D3 geometry constant per architecture
 
