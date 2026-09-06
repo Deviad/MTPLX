@@ -326,12 +326,14 @@ parity failures will be read as regressions caused by the fix.
 - [ ] **Step 2:** new `tests/test_qwen4_prefill_lane.py`: with a fake `qwen4_exp` layer set, assert
       the counter at `generation.py:1069` becomes non-zero past the ceiling. If no unit-level seam
       exists, that absence is itself the finding — add the seam.
-- [ ] **Step 3:** on the real model, sweep `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` downward in
-      powers of two and record where `paged_gqa_sdpa_calls` first goes non-zero, with tok/s per
-      setting. Arm D already showed 32768 leaves 103 k prefill unchanged (267.003 s vs 267.920 s).
-      Expected from `profiles.py:525`: repaging loses decode. If nothing ever makes the counter
-      non-zero, the lane is unreachable for `qwen4_exp` and that is the answer — write it into
-      `docs/perf/` rather than leaving it implied.
+- [ ] **Step 3:** sweep the lane from the *serve* harness, not the in-process one. On a fresh
+      server with an empty bank, run the matched-size pair (62–65 k new tokens) once per
+      `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` value (auto, 65536, 32768, 16384) and record
+      tok/s + counter per arm against the 657,9 tok/s cold reference. Arm D (in-process, ceiling
+      32768) measured 267.003 s vs 267.920 s, i.e. inside the 0,43 % noise. Expected from
+      `profiles.py:525`: repaging loses decode. If nothing ever makes the counter non-zero, the
+      lane is unreachable for `qwen4_exp` and that is the answer — write it into `docs/perf/`
+      rather than leaving it implied.
 - [ ] **Step 4:** commit the sweep table even if the result is negative.
 
 ### Task 4 — D3 geometry constant per architecture
@@ -349,7 +351,8 @@ parity failures will be read as regressions caused by the fix.
 
 ### Task 5 — D4 benchmark: serve-path harness + the norm crash — **steps 1 and 2 DONE 2026-09-06**
 
-Steps 1 and 2 shipped as `b742b8c` and `a04460d`. Measured against the live repo
+Steps 1 and 2 shipped as `b742b8c` and `a04460d`. The instrument question Step 2 raised is
+closed; see "Instrument reconciliation" in the receipt. Measured against the live repo
 build, the ladder runs qwen4_exp for the first time:
 
 ```
@@ -358,17 +361,21 @@ mtplx bench prefill-ladder --harness direct-http --port 9002 \
   --profile turbo --contexts 32768,65536 --max-tokens 16 --json
 ```
 
-Two facts this harness exposed that the in-process ladder could not:
+Three facts this harness exposed that the in-process ladder could not:
 
 - **Cold rows need a fresh server.** The session bank survives requests, so a repeated
   context answers `cached_tokens == prompt_tokens` with a 0 tok/s prefill (measured:
   32777/32777, ttft 0.30 s). Recorded in `serve_harness_note`; Task 3 must not read
   such a row as a result.
-- **The two instruments disagree by ~16 %.** Serve-mode 65.5k measured 627 tok/s; the
-  independent 2026-09-06 probe at ~51k measured 746. The prompt bodies differ (the
-  ladder's coding-agent filler vs the probe's repeated source text), so the delta is
-  an open item to resolve before Task 3 quotes any number, not something to average
-  away.
+- **Instrument disagreement was a measurement error of mine, now closed.** The 16 %
+  quoted in `a04460d` compared 746,8 tok/s (probe, 51.347 new tokens, engine time) with
+  627 tok/s (ladder, 63.494 new tokens, client TTFT) — size and measurement point changed
+  together. Re-measured on one fresh server per run with an empty session bank: probe
+  670,4 tok/s at 62.908 new, ladder 657,9 at 64.521 new; normalising the probe to the
+  ladder's size gives 660,7, so the prompt body accounts for **0,42 %**, client-vs-engine
+  overhead for **0,78 %**, and the rest was context-size decay (6,07 tok/s per 1000
+  tokens). All under the measured 0,43 % cold noise. Full table:
+  `docs/perf/receipts/qwen38-flash-next-prefill.md`, "Instrument reconciliation".
 
 Step 3 stays open: the ladder's rows now carry `cached_tokens` / `new_prefill_tokens`,
 which is the probe's substance, but there is no `kind` label yet, and the probe remains

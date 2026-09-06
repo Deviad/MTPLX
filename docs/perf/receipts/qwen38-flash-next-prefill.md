@@ -163,3 +163,27 @@ a5b93d39e0526701  scripts/prefill-probe.py
 94e941128509f319  scripts/serve-flash-next-9002.sh
 72a3706da4e6ccb1  scripts/serve-flash-next-uncensored-9001.sh
 ```
+
+## Instrument reconciliation — 2026-09-06 16:32 (supersedes the "~16 %" claim)
+
+A draft of Task 5's notes in `docs/plans/2026-09-06-long-context-prefill-handoff.md`
+and the commit message of `a04460d` said the ladder's serve harness and the probe
+"disagree by ~16 %". They do not. The figure compared 746,8 tok/s (probe, 51.347 new
+tokens, engine time) with 627 tok/s (ladder, 63.494 new tokens, client TTFT) — two
+variables changed at once. Measured again with one fresh server per run, an empty
+session bank, the same repo build, window 131072, chunk 2048:
+
+| strumento | token nuovi | tempo motore | rata motore | tempo client | rata client |
+|---|---|---|---|---|---|
+| probe, corpo funzione-sorgente | 50.549 | 67,81 s | 745,5 | — | — |
+| probe, corpo funzione-sorgente | 62.908 | 93,83 s | 670,4 | — | — |
+| ladder, corpo coding-agent | 64.521 | 98,07 s | **657,9** | 98,84 s | 652,8 |
+
+Decomposition of the 11,9 % that started this: **11,5 punti = dimensione del contesto**
+(pendenza locale misurata: 6,07 tok/s ogni 1000 token in più), **0,78 punti = client vs
+motore** sulla stessa identica richiesta, **0,42 punti = corpo del prompt**. Ripetibilità
+del probe tra due run dello stesso tipo: 0,18 %; rumore cold conosciuto: 0,43 %. Ogni
+residuo è quindi sotto il rumore: i due strumenti concordano.
+
+Artefatti: `prefill-probe-9002-instrument-20260906-162656.json`,
+`prefill-probe-9002-matched-20260906-163037.json` (raw, locali, come sopra).
