@@ -347,7 +347,34 @@ parity failures will be read as regressions caused by the fix.
       (see D2 note) — if it does change, something else moved and must be explained.
 - [ ] **Step 5:** commit.
 
-### Task 5 — D4 benchmark: serve-path harness + the norm crash
+### Task 5 — D4 benchmark: serve-path harness + the norm crash — **steps 1 and 2 DONE 2026-09-06**
+
+Steps 1 and 2 shipped as `b742b8c` and `a04460d`. Measured against the live repo
+build, the ladder runs qwen4_exp for the first time:
+
+```
+mtplx bench prefill-ladder --harness direct-http --port 9002 \
+  --model ~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed \
+  --profile turbo --contexts 32768,65536 --max-tokens 16 --json
+```
+
+Two facts this harness exposed that the in-process ladder could not:
+
+- **Cold rows need a fresh server.** The session bank survives requests, so a repeated
+  context answers `cached_tokens == prompt_tokens` with a 0 tok/s prefill (measured:
+  32777/32777, ttft 0.30 s). Recorded in `serve_harness_note`; Task 3 must not read
+  such a row as a result.
+- **The two instruments disagree by ~16 %.** Serve-mode 65.5k measured 627 tok/s; the
+  independent 2026-09-06 probe at ~51k measured 746. The prompt bodies differ (the
+  ladder's coding-agent filler vs the probe's repeated source text), so the delta is
+  an open item to resolve before Task 3 quotes any number, not something to average
+  away.
+
+Step 3 stays open: the ladder's rows now carry `cached_tokens` / `new_prefill_tokens`,
+which is the probe's substance, but there is no `kind` label yet, and the probe remains
+the only tool that can drive *my own* wrappers' ports with a per-port session bank.
+
+
 
 - [ ] **Step 1:** fix the crash independent of the harness: guard the `layer.input_layernorm`
       sites in `gdn_capture.py` (`:2892`, `:2948`, `:3033`) behind the arch's real attribute
