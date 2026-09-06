@@ -76,6 +76,48 @@ def is_qwen4_fixed_verify_config(config: dict[str, Any]) -> bool:
 
 QWEN4_FIXED_M4_VERIFY_ENV = "MTPLX_QWEN4_FIXED_M4_VERIFY"
 
+# qwen4_exp cannot run the qwen3-next structure verify lanes. The server already
+# coerces them (``openai._coerce_family_verify_strategy``) because the 27B fast path
+# introspects the qwen3-next DecoderLayer layout (``input_layernorm`` et al.) and raises
+# AttributeError on Flash-Next hyper-connection layers. The in-process ladder had to
+# learn that the hard way: hardcoding ``capture_commit`` produced qwen4-shaped capture
+# rows (``qkv/q/k/v/a/b``, no ``conv_states``) and then died in the generic commit with
+# ``KeyError: 'conv_states'`` (measured 2026-09-06). Lives here so the two entry points
+# cannot drift apart again.
+QWEN4_FAMILY_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
+    {"capture", "capture_commit", "graphbank", "graphbank_capture_commit", "target_prefix"}
+)
+FAMILY_VERIFY_STRATEGY = "batched"
+
+
+def model_type_is_qwen4_exp(model_ref: Any) -> bool:
+    """True when ``model_ref`` is a directory whose config.json says qwen4_exp."""
+    import json
+    from pathlib import Path
+
+    try:
+        cfg = json.loads(
+            (Path(str(model_ref)).expanduser() / "config.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return False
+    model_type = str(cfg.get("model_type") or "").strip().lower()
+    text_type = str((cfg.get("text_config") or {}).get("model_type") or "").strip().lower()
+    return model_type in QWEN4_FAMILY_MODEL_TYPES or text_type in QWEN4_FAMILY_MODEL_TYPES
+
+
+def family_verify_strategy(model_ref: Any, strategy: str) -> str:
+    """The verify strategy this pack's family can actually run."""
+    normalized = str(strategy or "").strip().lower().replace("-", "_")
+    if not normalized or not model_type_is_qwen4_exp(model_ref):
+        return strategy
+    if normalized in QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
+        return FAMILY_VERIFY_STRATEGY
+    return strategy
+
 
 def qwen4_fixed_verify_enabled() -> bool:
     raw = os.environ.get(QWEN4_FIXED_M4_VERIFY_ENV, "0").strip().lower()

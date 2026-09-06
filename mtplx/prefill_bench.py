@@ -852,6 +852,26 @@ def _ladder_profile(args: Any) -> Any:
     return get_profile(_resolved_default_profile_name(args))
 
 
+def _ladder_verify_route(model: str) -> tuple[str, str]:
+    """The verify strategy/core this pack's family can actually run.
+
+    The ladder measured ``capture_commit`` unconditionally, which is a qwen3-next
+    structure lane: the server coerces it to ``batched`` for qwen4_exp packs
+    (``openai._coerce_family_verify_strategy``) because the capture stack
+    introspects the qwen3-next layer layout. Measured on the Flash-Next pack, the
+    mismatch produced qwen4-shaped capture rows with no ``conv_states`` and then
+    ``KeyError: 'conv_states'`` inside the generic commit.
+    """
+    from .qwen4_fixed_verify import family_verify_strategy
+
+    strategy = family_verify_strategy(model, "capture_commit")
+    if strategy == "capture_commit":
+        return "capture_commit", "linear-gdn-from-conv-tape"
+    # batched is the family's base lane; "stock" is generate_mtpk's own default,
+    # so the ladder asks for what `mtplx serve` would run rather than a custom core.
+    return strategy, "stock"
+
+
 def _apply_family_verify_lane_override(model: str) -> str | None:
     """Install the verify lane the pack's own family requires, if any.
 
@@ -877,6 +897,14 @@ def _apply_family_verify_lane_override(model: str) -> str | None:
     if str(config.get("model_type") or "") != "qwen4_exp":
         return None
     os.environ.setdefault(QWEN4_FIXED_M4_VERIFY_ENV, "1")
+    # The batched coercion alone is not the family lane. `_coerce_family_strategy`
+    # (openai.py) documents the pairing: qwen4_exp verifies `batched` and rides
+    # `MTPLX_FAMILY_CAPTURE_COMMIT` for repair-free rollback. Without it, a rejected
+    # window has no snapshot to fall back on -- profiles default
+    # MTPLX_SKIP_VERIFY_SNAPSHOT=1 -- so generation raises
+    # "capture commit failed after MTPLX_SKIP_VERIFY_SNAPSHOT=1" (measured on the
+    # Flash-Next pack 2026-09-06, at ladder row 2k).
+    os.environ.setdefault("MTPLX_FAMILY_CAPTURE_COMMIT", "1")
     return os.environ[QWEN4_FIXED_M4_VERIFY_ENV]
 
 
@@ -1396,6 +1424,11 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
 
     apply_profile_env(profile.name)
     family_verify_lane = _apply_family_verify_lane_override(model)
+    ladder_verify_strategy, ladder_verify_core = _ladder_verify_route(model)
+    payload["verify_route"] = {
+        "verify_strategy": ladder_verify_strategy,
+        "verify_core": ladder_verify_core,
+    }
     if family_verify_lane:
         payload["family_verify_lane"] = {QWEN4_ENV_KEY: family_verify_lane}
     _apply_prefill_layout_override(prefill_layout)
@@ -1527,8 +1560,8 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
                     mtp_hidden_variant="post_norm",
                     mtp_cache_policy="persistent",
                     mtp_history_policy="committed",
-                    verify_strategy="capture_commit",
-                    verify_core="linear-gdn-from-conv-tape",
+                    verify_strategy=ladder_verify_strategy,
+                    verify_core=ladder_verify_core,
                     stop_token_ids=set(),
                     token_callback=record_first,
                 )

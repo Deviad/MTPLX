@@ -1046,14 +1046,11 @@ def _server_runtime_env_overrides(
 
 
 def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
-    try:
-        with open(Path(str(args.model)) / "config.json", "rb") as fh:
-            cfg = json.load(fh)
-    except Exception:
-        return False
-    mt = str(cfg.get("model_type") or "").lower()
-    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
-    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+    # Delegates to the single family predicate (qwen4_fixed_verify) so the server,
+    # the ladder route and the tests cannot disagree about who is Flash-Next.
+    from mtplx.qwen4_fixed_verify import model_type_is_qwen4_exp
+
+    return model_type_is_qwen4_exp(getattr(args, "model", None))
 
 
 _QWEN4_PORT_TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -2816,8 +2813,10 @@ def _validate_hyper_settings(args: argparse.Namespace) -> None:
         )
 
 
-_QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
-    {"capture", "capture_commit", "graphbank", "graphbank_capture_commit", "target_prefix"}
+# Aliased to the shared definition in qwen4_fixed_verify so the server coercion and the
+# in-process ladder cannot disagree about which lanes are qwen3-next structure lanes.
+from mtplx.qwen4_fixed_verify import (  # noqa: E402
+    QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES as _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES,
 )
 
 
@@ -2837,14 +2836,17 @@ def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
     strategy = (
         str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
     )
-    if strategy in _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
+    from mtplx.qwen4_fixed_verify import family_verify_strategy
+
+    coerced = family_verify_strategy(args.model, strategy)
+    if coerced != strategy:
         print(
             f"[serve] verify-strategy {strategy!r} is a qwen3-next structure "
             "lane; qwen4_exp verifies 'batched' (repair-free rollback rides "
             "the MTPLX_FAMILY_CAPTURE_COMMIT env lane). Coercing.",
             flush=True,
         )
-        args.verify_strategy = "batched"
+        args.verify_strategy = coerced
 
 
 class ServerState:
