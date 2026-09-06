@@ -631,3 +631,41 @@ request 2 is itself the evidence that the mismatch was real: an aligned cache st
 `tests/test_qwen4_exp_capture_commit.py::test_fixed_m4_falls_back_to_materialized_when_device_history_is_ahead`,
 red first with the production traceback, pinning both routes and the counter. Full suite exit 0.
 
+## Screening the opt-in QSA kernels for the remaining criterion-3 gap (2026-09-07 01:54)
+
+`scripts/qsa_optin_battery.py`, one env per arm, one server process per arm, the session bank emptied
+per arm so every cold row is cold, 104 k rung, side-by-side 9003. Four arms, **one run each** -- a
+screen, not a claim: criterion 3 wants a median of >= 3 and this table cannot supply one.
+
+| arm | env | cold s | cold tok/s | follow-up s | ms per new token | greedy fingerprint |
+|---|---|---|---|---|---|---|
+| baseline | -- | 118.09 | 858.3 | 2.111 | 3.118 | reference |
+| gather | `MTPLX_QSA_GATHER=1` | 116.99 | 866.2 | 1.887 | 2.779 | match |
+| fused_indexer | `MTPLX_FUSED_QSA_INDEXER=1` | 118.01 | 859.3 | 2.059 | 3.064 | match |
+| **compiled_indexer** | `MTPLX_COMPILED_QSA_INDEXER=1` | 118.64 | 854.5 | **1.598** | **2.378** | match |
+
+Read what the table can and cannot say:
+
+- **Cold prefill does not move** (117.0-118.6 s across all four arms, inside the ~5 % single-run
+  noise seen at 8 k), so none of these kernels is a lever for criterion 4 -- which is already met.
+- **The follow-up moves, and one arm moves it a lot**: `MTPLX_COMPILED_QSA_INDEXER=1` is -24.3 %
+  against its own same-session baseline (1.598 s vs 2.111 s), well outside that noise. `gather` is
+  -10.6 %, `fused_indexer` -2.5 %.
+- **These absolute numbers are worse than the ones earlier in this receipt** (baseline follow-up
+  2.111 s here vs 1.56 s at 23:45, cold 118.09 vs 104.68) because the machine is now carrying three
+  resident packs and full session banks -- 9002 at 83.4 GiB RSS, 9003 at 58.3 GiB, 9001 compressed
+  down to 2.3 GiB RSS, 26 % memory free, swap 171.62 MiB, and 91 GiB of bank blobs plus 48 GiB in
+  `flash-next-9002`. Comparisons inside this table are valid; comparisons against the earlier tables
+  are not. That sensitivity is itself worth remembering when reading any number in this file.
+- **Exactness held on the leg that was run**: a greedy 64-token completion of a fixed short prompt,
+  fingerprinted as content + reasoning content + finish reason, matched the baseline in all three
+  arms. That is a real check and a narrow one -- it exercises the indexer at short context, while the
+  candidate's risk is at long context. Before this is enabled on a serving port it needs the same
+  fingerprint on a 100 k-class prompt, and the median of >= 3 follow-ups per arm that criterion 3
+  asks for.
+
+So the screen says where to look next and nothing more: `MTPLX_COMPILED_QSA_INDEXER` is the one
+candidate worth a confirmation battery, and it is already reachable per port (it is registered in
+`MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, `profiles.py:323`), so enabling it needs no code change -- which
+is also why it must be measured properly before anyone flips it.
+

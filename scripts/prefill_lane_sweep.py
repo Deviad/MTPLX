@@ -48,15 +48,22 @@ RUN_TAG = "lanematch"          # fixed: identical prompt bytes across arms
 CONTEXTS = "64k"
 
 
-def configure(*, port: int, serve: str, bank: str, probe: str, contexts: str) -> None:
-    """Rebind the run's targets once, before any arm boots."""
+def configure(*, port: int, serve: str = "", bank: str = "", probe: str = "",
+              contexts: str = "") -> None:
+    """Rebind the run's targets once, before any arm boots.
+
+    Empty values resolve to the documented defaults, so this is also the entry
+    point for other tools that drive the same server (the opt-in kernel battery
+    imports it rather than re-implementing stop/boot/row-reading). One place
+    composes the defaults: a caller cannot pass a half-configured run.
+    """
     global PORT, LOG_ROWS, BANK, SERVE, PROBE, CONTEXTS
     PORT = int(port)
     LOG_ROWS = MTPLX_HOME / "logs" / f"request-log-{PORT}.jsonl"
-    BANK = Path(bank)
-    SERVE = Path(serve)
-    PROBE = Path(probe)
-    CONTEXTS = contexts
+    BANK = Path(bank) if bank else MTPLX_HOME / "session-bank" / f"flash-next-repo-{PORT}"
+    SERVE = Path(serve) if serve else MTPLX_HOME / "scripts" / f"serve-repo-{PORT}.sh"
+    PROBE = Path(probe) if probe else HERE / "prefill_probe.py"
+    CONTEXTS = contexts or CONTEXTS
 
 ARMS: dict[str, dict[str, str]] = {
     "auto": {},
@@ -202,9 +209,9 @@ def main() -> int:
 
     configure(
         port=args.port,
-        serve=args.serve or str(MTPLX_HOME / "scripts" / f"serve-repo-{args.port}.sh"),
-        bank=args.bank or str(MTPLX_HOME / "session-bank" / f"flash-next-repo-{args.port}"),
-        probe=args.probe or str(HERE / "prefill_probe.py"),
+        serve=args.serve,
+        bank=args.bank,
+        probe=args.probe,
         contexts=args.contexts,
     )
     if not SERVE.exists():
