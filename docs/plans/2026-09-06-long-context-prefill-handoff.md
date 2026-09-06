@@ -319,6 +319,22 @@ parity failures will be read as regressions caused by the fix.
       `context_length`.
 - [ ] **Step 5:** commit.
 
+### Task 3 — D2 paged lane: step 3 executed (negative), step 1 is now the critical path
+
+Step 3 ran 2026-09-06 from the serve harness: `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` ∈
+{auto, 65536, 32768, 16384} at a matched 62.908-new-token prompt, one fresh server per arm.
+Result: **+0,40 %** between `auto` and `32768` means, 1,07 % spread across arms, and
+`paged_gqa_sdpa_calls` **0 in every arm** including the aggressive ceilings. The ceiling knob
+does not reach this family's prefill, so "make it fire" cannot be answered by tuning.
+Table, run list and the one non-replicating outlier (a first 32768 reading of 637,7 tok/s that
+repeats put at 675,7 / 669,0): `docs/perf/receipts/qwen38-flash-next-prefill.md`,
+"Task 3 sweep".
+
+That leaves step 1 as the only way forward, and it is a prerequisite rather than a nicety:
+qwen4_exp request rows carry no `prefill_layout` / `prefill_attention_impl` at all, so today we
+know the lane did not run only from absent counters. Implement the emission before deciding
+whether the lane is unreachable, or every further sweep stays unfalsifiable.
+
 ### Task 3 — D2 paged lane: make it fire, then make it provable
 
 - [ ] **Step 1:** instrument first — emit `prefill_attention_impl` and `prefill_layout` on every

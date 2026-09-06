@@ -187,3 +187,38 @@ residuo è quindi sotto il rumore: i due strumenti concordano.
 
 Artefatti: `prefill-probe-9002-instrument-20260906-162656.json`,
 `prefill-probe-9002-matched-20260906-163037.json` (raw, locali, come sopra).
+
+## Task 3 sweep — `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` does not move qwen4_exp prefill
+
+2026-09-06 16:36–16:57. Serve harness, repo build, one fresh server per arm, session bank
+emptied per arm, matched prompt: 62.908 new tokens, identical bytes across arms (fixed
+`--tag sweep` salt), `--profile turbo --depth 3 --context-window 131072 --prefill-chunk-tokens
+2048 --scheduler-mode serial`. Rate = engine `prompt_eval_time_s`.
+
+| braccio | tok/s note |
+|---|---|
+| auto (16:32) | 670,4 |
+| auto ctl1 | 670,2 |
+| auto ctl2 | 668,5 |
+| 65536 | 673,6 |
+| 16384 | 669,4 |
+| 32768, prima run | **637,7** |
+| 32768 rip1 | 675,7 |
+| 32768 rip2 | 669,0 |
+
+`auto` mean 669,7 (n=3) vs `32768` mean 672,4 (n=2, after repeating): **+0,40 %**. Spread
+across every arm excluding the first 32768 run: **1,07 %** (668,5–675,7). The 637,7 reading is
+a non-replicating outlier — the reason this section records repeats: a single-arm run cannot
+support a claim below ~5 %, and the draft conclusion "32768 costs 4,9 %" was already written
+before the interleaved control disproved it.
+
+Counters in **every** arm, including the most aggressive ceiling: `paged_gqa_sdpa_calls` 0,
+`prefill_partitioned_paged_calls` 0, `prefill_dense_fallback_calls` 0,
+`large_q_split_sdpa_fallback_calls` 0. Consistent with arm D (in-process, ceiling 32768:
+267,003 s vs 267,920 s baseline) and with `profiles.py:525`, which records dense decode as the
+faster side of the fence.
+
+What the sweep could not observe: the request rows for this family carry no
+`prefill_layout` / `prefill_attention_impl` keys at all, so "the lane was not chosen" is known
+from absent counters, not from a positive statement of what ran. That gap is Task 3 step 1 and
+it is now the critical path — see the handoff.
