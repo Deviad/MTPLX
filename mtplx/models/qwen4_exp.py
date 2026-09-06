@@ -62,6 +62,23 @@ from mtplx.attention_context import current_attention_phase
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
 
 
+def _installed_arrays_cache():
+    """The ArraysCache class mlx-lm currently exports, resolved at call time.
+
+    ``install_arrays_cache_fix()`` rebinds ``mlx_lm.models.cache.ArraysCache`` to the
+    vendored leak-free subclass, and ``a3b_mtp_batch`` calls it at import time. The
+    module-level ``from mlx_lm.models.cache import ArraysCache`` froze the stock
+    object instead, so caches built here were instances of a different class than the
+    one ``graphbank.build_verify_state_spec`` isinstance-checks at call time. That
+    arrived as ``unsupported_container:ArraysCache`` and killed the prefill ladder's
+    fixed-M4 lane -- and, less loudly, meant this family's GDN caches kept the
+    deferred-advance leak the vendored class exists to close.
+    """
+    from mlx_lm.models.cache import ArraysCache
+
+    return ArraysCache
+
+
 @dataclass
 class TextArgs(BaseModelArgs):
     model_type: str = "qwen4_exp_text"
@@ -5087,7 +5104,7 @@ class Qwen4ExpTextModel(nn.Module):
             rows = []
             k = 0
             for layer in layers:
-                c = ArraysCache(size=2)
+                c = _installed_arrays_cache()(size=2)
                 c[0], c[1] = flat[k], flat[k + 1]
                 k += 2
                 h = layer(h, input_ids=None, ssm_mask=None, cache=c)
@@ -5416,9 +5433,9 @@ class TextModel(nn.Module):
             if not layer.is_linear:
                 caches.append(QSACache(ratio))
             elif "ple" in layer:
-                caches.append(ArraysCache(size=4))
+                caches.append(_installed_arrays_cache()(size=4))
             else:
-                caches.append(ArraysCache(size=2))
+                caches.append(_installed_arrays_cache()(size=2))
         return caches
 
 

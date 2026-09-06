@@ -375,11 +375,41 @@ every `"ple"` layer, and one such entry poisons the whole layer list. Pinned in
 `None` *is* accepted — which is why the fix must populate or defer the leaves rather than relax
 the guard and hand the compiled core `None`.
 
-- [ ] **Confirm by run, not inference:** the eager-vs-fatal step is believed to come from the
-      fixed-M4 verify lane that D4 switched on for this family. The falsification is one in-process
-      ladder run with `MTPLX_QWEN4_FIXED_M4_VERIFY=0` at a small context. Not run yet: the ladder
-      loads the model in-process and must not overlap a server holding the same weights
-      (`prefill-ladder-baseline.sh` header), so it needs 9001 and 9002 stopped for ~4 minutes.
+- [x] **Confirm by run, and the run said the proposed A/B was the wrong experiment.** With the
+      lane at 0 the ladder dies earlier, in `runtime.forward_ar_capture`'s named RuntimeError (the
+      D4 guard), so `=0` could not isolate anything — reading the code first showed that, and the
+      run that mattered was the default one. 2026-09-06 19:1x, 9001/9002 stopped, ladder at 2k
+      context, 20 s, both servers restarted to health 200 afterwards:
+
+      ```
+      compiled-verify prewarm {"skipped": ["unsupported_container:ArraysCache"], "complete": false}
+      ...
+      graphbank.py:3548, in _fallback
+          raise RuntimeError(f"qwen4 fixed-M4 verifier refused: {reason}")
+      RuntimeError: qwen4 fixed-M4 verifier refused: unsupported_container:ArraysCache
+      ```
+
+- [x] **Root cause 1 — class identity, fixed here.** The reason string has no `[N]` suffix, so it
+      came from the *final* branch (`unsupported_container:{type(entry).__name__}`): `isinstance`
+      failed on an object whose class is named `ArraysCache`. `a3b_mtp_batch:38` installs the
+      vendored cache fix **at import time**, which rebinds `mlx_lm.models.cache.ArraysCache`, while
+      `qwen4_exp.py:53` had already frozen the stock object with `from ... import ArraysCache`.
+      Two different class objects, one process. Reproduced and pinned in ~10 lines with no weights
+      (`tests/test_qwen4_arrays_cache_identity.py`): before the fix
+      `build_verify_state_spec([q4.ArraysCache(2)]) -> (None, 'unsupported_container:ArraysCache')`.
+      `qwen4_exp` now resolves the class at call time. Side effect worth noting: until this change,
+      this family's GDN caches were **stock** `ArraysCache` instances in the ladder path, i.e.
+      without the deferred-advance bookkeeping that the vendored class exists to add.
+- [ ] **Root cause 2 — still open, and it is a design call.** With identity fixed, the same 48-layer
+      cache list (36 GDN, one of them `ple`, 12 QSA) is now refused for the *other* reason:
+      `unsupported_container:ArraysCache[partial_ple]` — `make_cache()` gives `ple` layers a
+      size-4 cache whose leaves are all `None` until the first write, and the guard requires four
+      real leaves. The options are populate-or-defer those leaves before the spec is built, or
+      teach the fixed-M4 core an unwritten `ple` slot. Relaxing the guard is not an option: it
+      would hand the compiled verifier `None` where it expects arrays, and the two-leaf case
+      already accepts a `None` slot (`tests/test_graphbank_verify_state_spec.py` pins the
+      asymmetry). This is upstream-shaped code, so it deserves a report to the author rather than
+      a local patch in the same commit as the identity fix.
 
 
 ### Task 4 — D3 geometry constant per architecture
