@@ -154,6 +154,28 @@ is the engine field, never the client wall time.
   `rt = load(getattr(args, "model"), mtp=True)` at `prefill_bench.py:1108`. Result: measuring the
   serve path needed an external script (`~/.mtplx/scripts/prefill-probe.py`), which is a symptom.
 
+### Status of D4 after 2026-09-06 (measured on the repo runtime, not theorised)
+
+The `AttributeError` is gone: `runtime.forward_ar_capture` now asks
+`gdn_capture.generic_hybrid_capture_blocker` first and raises a named error that says
+which attribute is missing, which `model_type` it hit, and which lane to install; and
+`prefill_bench._apply_family_verify_lane_override` sets `MTPLX_QWEN4_FIXED_M4_VERIFY=1`
+for `qwen4_exp` packs the way the server does (commit `b742b8c`, tests in
+`tests/test_qwen4_capture_lane.py`, 8 cases).
+
+**The ladder still cannot run qwen4_exp.** With the lane now enabled it stops one step
+later, at the lane's own validator (`graphbank.py:1203`):
+
+```
+RuntimeError: qwen4 fixed-M4 verifier refused: unsupported_container:ArraysCache[...]
+```
+
+because the ladder's `runtime.load(...)` builds `ArraysCache` where the family lane
+requires the server's owned-container caches. That is Task 5 Step 2's argument stated as
+a fact: hand-mirroring server env in the bench reaches a second wall, so the ladder needs
+to drive a real server (`--url/--port`) instead of approximating one. Task 5 Step 1 is
+done; Step 2 is now the critical path, and Task 3 (D2) depends on it.
+
 ### D5 — KV quantization is refused for this family
 
 - `mtplx/backends/descriptors.py:481` carries the refusal text ("…attention has no validated
