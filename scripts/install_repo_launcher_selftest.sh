@@ -15,6 +15,9 @@ set -uo pipefail
 # P - the rc PATH line: absent / already in front / appended-behind / commented.
 # S - the measurement scripts: install / idempotence / --check / checkout moved on /
 #     hand-edited copy / a checkout that carries none of them.
+# L - the QSA sparse prefill lane probe: available / missing extension on a machine
+#     that can build it (drift) / missing without a toolchain (warning only) /
+#     ABI receipt mismatch / a probe that does not answer / the opt-out.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/scripts/install_repo_launcher.sh"
@@ -391,6 +394,79 @@ echo "$out" | grep -q 'carries none of the measurement scripts' && ok "dichiara 
 printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/S-scripts.result"; rm -rf $T
 }
 
+suite_L() {
+T=$RUNDIR/L; rm -rf $T; mkdir -p $T/home/.mtplx $T/bin
+H=$T/healthy; export UVLOG=$T/uvargs HEALTHFILE=$H
+P=0;F=0; ok(){ echo "  OK   $1"; P=$((P+1)); }; no(){ echo "  FAIL $1"; F=$((F+1)); }
+NAMES="prefill_probe.py prefill_lane_sweep.py followup_repeat.py suffix_width_sweep.py prefill_ladder_baseline.sh"
+mkrepo(){ local r=$1; mkdir -p $r/.venv/bin $r/scripts
+  printf '#!/bin/sh\necho "mtplx-fixture 1.0"\n' > $r/.venv/bin/mtplx; chmod +x $r/.venv/bin/mtplx
+  cat > $r/.venv/bin/python3 <<SHIM
+case "\$*" in
+  *MTPLX_LANE_PROBE*) [ -n "\$LANE_PROBE_ANSWER" ] && printf 'MTPLX_LANE_PROBE %s\n' "\$LANE_PROBE_ANSWER"; exit 0 ;;
+  *mlx.core*) echo "0.9.9-shim"; exit 0 ;;
+  *import*mtplx*) [ -f "$H" ] && exit 0 || exit 1 ;;
+esac
+exit 0
+SHIM
+  chmod +x $r/.venv/bin/python3; cp "$SRC" $r/scripts/install_repo_launcher.sh
+  local n; for n in $NAMES; do printf '#!/usr/bin/env python3\n# fixture %s\n' "$n" > $r/scripts/$n; done; }
+printf '#!/bin/sh\nexit 0\n' > $T/bin/uv
+# toolchain presente => costruibile; xcrun che fallisce => non costruibile
+printf '#!/bin/sh\nexit 0\n' > $T/bin/cmake
+printf '#!/bin/sh\nexit 0\n' > $T/bin/xcrun
+chmod +x $T/bin/uv $T/bin/cmake $T/bin/xcrun
+: > $H; mkrepo $T/repo
+export PATH=$T/bin:$PATH
+# MTPLX_NO_SHELL_PROBE=1: in un HOME finto la sonda di login risolve il launcher
+# vero della macchina, non quello della fixture, e falserebbe i codici di uscita.
+q(){ HOME=$T/home MTPLX_HOME=$T/home/.mtplx MTPLX_RC=$T/home/.zshrc MTPLX_NO_SHELL_PROBE=1 \
+     LANE_PROBE_ANSWER="$1" bash $T/repo/scripts/install_repo_launcher.sh "${@:2}" 2>&1; }
+
+echo "=== L0 stato allineato di partenza ==="
+out=$(q '{"state": "OK", "detail": "built_against_mlx 0.32.2"}'); rc=$?
+[ $rc = 0 ] && ok "prima installazione exit 0" || no "rc=$rc :: $out"
+
+echo "=== L1 corsia disponibile ==="
+out=$(q '{"state": "OK", "detail": "built_against_mlx 0.32.2"}' --check); rc=$?
+echo "$out" | grep -q 'sparse prefill available' && ok "dice che la corsia c'e'" || no "$out"
+[ $rc = 0 ] && ok "--check exit 0 (nessun drift)" || no "rc=$rc :: $out"
+
+echo "=== L2 estensione mancante, macchina che puo compilarla => drift ==="
+out=$(q '{"state": "MISSING_EXT", "detail": "No module named mtplx_qsa_kernels"}' --check); rc=$?
+echo "$out" | grep -q 'dense QSA prefill' && ok "nomina la ricaduta densa" || no "$out"
+echo "$out" | grep -q 'actionable' && ok "la dichiara azionabile" || no "$out"
+echo "$out" | grep -q 'nanobind==2.15.0' && ok "da la ricetta col pin esatto" || no "ricetta assente: $out"
+echo "$out" | grep -q 'build_ext --inplace' && ok "da il comando di build" || no "comando assente"
+{ [ $rc = 1 ] && echo "$out" | grep -q 'drift found'; } && ok "--check exit 1" || no "rc=$rc :: $out"
+
+echo "=== L3 estensione mancante, niente toolchain => avviso, non drift ==="
+printf '#!/bin/sh\nexit 1\n' > $T/bin/xcrun
+out=$(q '{"state": "MISSING_EXT", "detail": "No module named mtplx_qsa_kernels"}' --check); rc=$?
+echo "$out" | grep -q 'not$' || true
+echo "$out" | grep -q 'actionable on this machine' && ok "dice perche non e azionabile" || no "$out"
+[ $rc = 0 ] && ok "--check exit 0 (inconcludente-per-toolchain != drift)" || no "rc=$rc :: $out"
+printf '#!/bin/sh\nexit 0\n' > $T/bin/xcrun; chmod +x $T/bin/xcrun
+
+echo "=== L4 receipt ABI non corrispondente => drift (ricostruire dopo l upgrade di mlx) ==="
+out=$(q '{"state": "MISMATCH", "detail": "built 0.32.2 imported 0.33.0"}' --check); rc=$?
+echo "$out" | grep -q 'MISMATCH' && ok "nomina il mismatch" || no "$out"
+{ [ $rc = 1 ] && echo "$out" | grep -q 'Rebuild after any mlx upgrade'; } && ok "exit 1 + istruzione a ricostruire" || no "rc=$rc :: $out"
+
+echo "=== L5 sonda che non risponde => inconcludente, non drift ==="
+out=$(q '' --check); rc=$?
+echo "$out" | grep -q 'inconclusive, not drift' && ok "inconcludente dichiarato" || no "$out"
+[ $rc = 0 ] && ok "--check exit 0" || no "rc=$rc :: $out"
+
+echo "=== L6 opt-out ==="
+out=$(HOME=$T/home MTPLX_HOME=$T/home/.mtplx MTPLX_RC=$T/home/.zshrc MTPLX_NO_SHELL_PROBE=1 \
+      MTPLX_NO_LANE_PROBE=1 bash $T/repo/scripts/install_repo_launcher.sh --check 2>&1); rc=$?
+echo "$out" | grep -q 'probe skipped' && ok "salta su richiesta" || no "$out"
+[ $rc = 0 ] && ok "exit 0 senza sonda" || no "rc=$rc :: $out"
+
+printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/L-qsa-lane.result"; rm -rf $T
+}
+
 run_suite() {
   local name=$1 fn=$2
   printf '\n########## %s ##########\n' "$name"
@@ -404,6 +480,7 @@ run_suite() {
 run_suite A-mechanism suite_A
 run_suite P-path suite_P
 run_suite S-scripts suite_S
+run_suite L-qsa-lane suite_L
 if [ "$with_real" = 1 ]; then
   if command -v uv >/dev/null 2>&1; then
     run_suite B-real-uv suite_B

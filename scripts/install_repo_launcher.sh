@@ -445,6 +445,109 @@ install_repo_scripts() {
 
 install_repo_scripts
 
+# --- 5. the QSA sparse prefill lane: is the speed this checkout can serve on? --
+# The long-context prefill win on M3-class GPUs comes from a vendored native
+# extension (native_extensions/qsa_kernels) whose artifacts are GITIGNORED: a
+# fresh clone, or a venv rebuilt by `uv sync`, silently falls back to dense QSA
+# prefill and the 103 k cold prefill goes from ~105 s back to ~251 s. Nothing at
+# boot says so -- the engine logs one line at first use and nobody reads it.
+# So the guard lives here, where the rest of "is this checkout really serving"
+# already lives.
+#
+# Inconclusive is NOT drift, same rule as the shell probe: a machine without a
+# Metal toolchain cannot build the extension, and failing `--check` forever
+# there would be noise, not a signal. Set MTPLX_NO_LANE_PROBE=1 to skip.
+lane_buildable() {
+  command -v cmake >/dev/null 2>&1 || return 1
+  xcrun -sdk macosx metal --version >/dev/null 2>&1 || return 1
+}
+
+lane_build_recipe() {
+  printf '         build it in the venv that serves:\n'
+  printf '           uv pip install --python %s "nanobind==2.15.0" "setuptools>=42"\n' "$venv_python"
+  printf '           (cd %s/native_extensions/qsa_kernels && %s setup.py build_ext --inplace)\n' "$repo" "$venv_python"
+  printf '         nanobind is pinned exactly: a mismatch imports cleanly and then\n'
+  printf '         rejects every mx.array (oMLX #2139). Rebuild after any mlx upgrade.\n'
+}
+
+if [ "${MTPLX_NO_LANE_PROBE:-0}" != 1 ]; then
+  if [ ! -x "$venv_python" ]; then
+    printf 'qsa lane: not probed, %s is missing\n' "$venv_python"
+  else
+    # One line, one token, so a noisy import cannot be mistaken for an answer.
+    lane_answer=$(timeout 180 "$venv_python" -P -c '
+import json
+out = {"state": "UNKNOWN"}
+try:
+    import mlx.core as mx
+    if not mx.metal.is_available():
+        out = {"state": "UNSUPPORTED", "detail": "metal unavailable"}
+    else:
+        from mtplx.kernels import qsa_prefill_direct as d
+        err = getattr(d, "_IMPORT_ERROR", None)
+        if err is not None:
+            # Flat, quote-free detail: the shell side reads it with one sed, and
+            # nested JSON would be truncated at the first escaped quote.
+            out = {"state": "MISSING_EXT", "detail": str(err).replace(chr(34), "")}
+        else:
+            info = d.qsa_prefill_direct_build_info()
+            built = str(info.get("built_against_mlx"))
+            imported = str(info.get("imported_mlx"))
+            if built != imported:
+                out = {
+                    "state": "MISMATCH",
+                    "detail": "built_against_mlx=%s imported_mlx=%s" % (built, imported),
+                }
+            else:
+                from mtplx.models.qwen4_exp import qsa_prefill_lane_auto_supported
+                out = {
+                    "state": "OK" if qsa_prefill_lane_auto_supported() else "UNSUPPORTED",
+                    "detail": "mlx %s, nanobind %s" % (imported, info.get("built_against_nanobind")),
+                }
+except Exception as exc:
+    out = {"state": "PROBE_FAILED", "detail": "%s: %s" % (type(exc).__name__, exc)}
+print("MTPLX_LANE_PROBE " + json.dumps(out, sort_keys=True))
+' 2>/dev/null | grep '^MTPLX_LANE_PROBE ' | tail -1 | sed 's/^MTPLX_LANE_PROBE //') || true
+    lane_state=""
+    lane_detail=""
+    if [ -n "$lane_answer" ]; then
+      lane_state=$(printf '%s' "$lane_answer" | sed -n 's/.*"state": *"\([A-Z_]*\)".*/\1/p')
+      lane_detail=$(printf '%s' "$lane_answer" | sed -n 's/.*"detail": *"\([^"]*\)".*/\1/p')
+    fi
+    case "$lane_state" in
+      OK)
+        printf 'qsa lane: sparse prefill available (%s)\n' "${lane_detail:-receipts ok}"
+        ;;
+      MISSING_EXT|MISMATCH)
+        printf 'qsa lane: %s -- dense QSA prefill, the slow curve\n' "$lane_state"
+        [ -n "$lane_detail" ] && printf '         %s\n' "$lane_detail"
+        if lane_buildable; then
+          drift=1
+          printf '         this machine can build it (cmake + xcrun metal), so this is actionable\n'
+          lane_build_recipe
+          if [ "$check_only" != 1 ]; then
+            printf '         not built for you: a native compile is not an install step\n'
+          fi
+        else
+          printf '         no cmake or no `xcrun -sdk macosx metal` here, so this is not\n'
+          printf '         actionable on this machine -- reported, not counted as drift\n'
+        fi
+        ;;
+      UNSUPPORTED)
+        printf 'qsa lane: not available on this machine (%s)\n' "${lane_detail:-no fast consumer}"
+        ;;
+      PROBE_FAILED)
+        printf 'qsa lane: probe failed (%s) -- inconclusive, not drift\n' "${lane_detail:-unknown}"
+        ;;
+      *)
+        printf 'qsa lane: did not answer (timeout or import noise) -- inconclusive, not drift\n'
+        ;;
+    esac
+  fi
+else
+  printf 'qsa lane: probe skipped (MTPLX_NO_LANE_PROBE=1)\n'
+fi
+
 if [ "$check_only" = 1 ]; then
   if [ "$drift" = 1 ]; then
     printf '\n--check: drift found, nothing written\n'

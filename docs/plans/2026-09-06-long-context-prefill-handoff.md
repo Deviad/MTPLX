@@ -656,11 +656,12 @@ via its `state` property (`:2099-2107`).
 - [ ] **Step 4 — PARTLY met 2026-09-06 23:45; open on criterion 3 and on durability.** Criterion 4
       is met: cold 103 k **104.68 s median of 3** against the 134 s target (267.920 s baseline).
       Criterion 3 is not: follow-up **1.56 s median of 3** against a 1.40 s target, 11.4 % above,
-      though that is -44.4 % from the 2.805 s baseline. Still open here: (i) 9001 and 9002 are
-      running processes started before the build, so they still have the lane off and pick it up only
-      at their next restart; (ii) nothing at boot warns when the extension is missing, so a fresh
-      clone or a rebuilt venv silently returns to the slow curve -- a doctor or wrapper check is the
-      obvious follow-up and is not built; (iii) two pre-existing defects surfaced by the measurement
+      though that is -44.4 % from the 2.805 s baseline. Still open here: (i) CLOSED 2026-09-07 00:49 -- both ports restarted one at a time and measured lane-on
+      (cold 52 k: 9002 55.94 s / 905.9 tok/s against the 68.35 s lane-off reference, 9001
+      57.02 s / 905.9 tok/s; follow-ups 1.45 s and 1.52 s with the breakdown complete); (ii) CLOSED 2026-09-07 01:05 -- `install_repo_launcher.sh` section 5 probes the lane through
+      the serving venv, and `MISSING_EXT`/`MISMATCH` fail `--check` (exit 1) on any machine that
+      can build the extension, print the recipe, and are reported-but-not-drift where no Metal
+      toolchain exists; (iii) two pre-existing defects surfaced by the measurement
       and belong in their own slices: an identical repeat request 500s at `qwen4_fixed_verify.py:269`
       (`qwen4 fixed-M4 prompt history does not match the prefetched cache`, check introduced by
       `d6018d2`, ported from PR #391 -- and a repeat is a retry-shaped request), and a diverging

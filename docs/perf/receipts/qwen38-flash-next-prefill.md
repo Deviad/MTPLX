@@ -542,12 +542,34 @@ on the faster curve, so criteria 3 and 4 remain one fix rather than two.
    that extends the chain. Rows: `~/.mtplx/logs/request-log-9003.jsonl`, artifacts
    `~/.mtplx/bench/prefill-probe-9003-qsa{A,A2,A3,B}-*.json`.
 
-### What is not done
+### What was not done at the time, and has since been closed (2026-09-07 01:05)
 
-9001 and 9002 are still running processes started **before** the build, so they still have the lane
-off; they pick it up at their next restart. Nothing in the boot path warns when the extension is
-missing, so a fresh clone silently returns to the slow curve — a doctor/wrapper check is the obvious
-follow-up, and it is not built yet.
+Both gaps this section named are shut:
+
+- **9001 and 9002 now run the lane.** Restarted from the same wrappers at 00:47 and 00:49, one port
+  at a time so the other kept serving; both came back health 200 with their intended ids
+  (`mtplx-flash-next-uncensored`, `mtplx-flash-next`) and `context_length: 131072`. Measured on each
+  after the restart, cold 52 k with `--unique-body`: **9002 55.94 s / 905.9 tok/s** (the lane-off
+  reference for this pack is 68.35 s / 742.0, the lane-on one 56.24 s / 902.0 -- so -18.2 % against
+  off and -0.5 % against on) and **9001 57.02 s / 905.9 tok/s** on the 4-bit pack. Follow-ups on the
+  live ports: 1.45 s at 50 663 cached (9002) and 1.52 s at 51 647 (9001), both with
+  `prompt_eval_breakdown_complete: True` and parts summing to the total to the last digit, so the
+  prompt-phase instrument is live on the ports that matter and not only on the side-by-side.
+- **A missing extension is now a failed check, not a silence.** `scripts/install_repo_launcher.sh`
+  grew a fifth section that probes the lane through the serving venv and reports one of: available
+  (with the mlx and nanobind receipts), `MISSING_EXT`, `MISMATCH`, unsupported, or inconclusive.
+  `MISSING_EXT` and `MISMATCH` are drift -- exit 1 under `--check` -- **only when the machine can
+  actually build it** (`cmake` plus a working `xcrun -sdk macosx metal`); without a toolchain the
+  same state is reported and explicitly not counted as drift, because a check that can never pass is
+  noise. Inconclusive (timeout, import noise) is never drift, the rule the shell probe already
+  follows. `MTPLX_NO_LANE_PROBE=1` skips it; the whole `--check` costs 2 s here.
+
+  Proven on a real slice, not only in fixtures: with the built artifacts moved aside, `--check`
+  returned exit 1 printing `MISSING_EXT -- dense QSA prefill, the slow curve`, the real
+  `No module named 'mtplx_qsa_kernels'`, and the exact build commands with this venv's paths; the
+  artifacts went back with identical shas, `--check` returned to exit 0, and 9001/9002 stayed 200
+  throughout. Sixteen fixture cases cover the branches a real machine cannot be walked through
+  (`L-qsa-lane` in `scripts/install_repo_launcher_selftest.sh`, which is at 94/94 overall).
 
 ## Where the instruments behind these numbers live now (2026-09-07 00:38)
 
