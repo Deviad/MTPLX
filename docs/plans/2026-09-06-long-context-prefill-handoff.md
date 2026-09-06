@@ -606,36 +606,63 @@ ctx -- not a dense attention over the whole context. `QSACache` keeps `raw_keys`
 after a documented O(N^2) incident (`_grown_cap`, `:1939`), and round-trips through the session bank
 via its `state` property (`:2099-2107`).
 
-- [ ] **Step 1 — find the knobs before building an instrument.** Enumerate what already varies the
-      selection cost: the indexer compress ratio (`indexer_compress_ratio`, default 4), the top-k
-      budget and its `_tiled_topk` / `_select_eager` paths (`:2322`, `:2357`), the
-      `_prepare_kernel_supported` gate (`:2182`), and any env that changes the engage threshold.
-      Deliverable: a list in this plan of each knob, its default, and whether it is env-reachable on
-      the serve path. No code change.
-- [ ] **Step 2 — attribute the long-context term by ablation, not by stopwatch.** Metal is async, so
-      `time.perf_counter()` around lazy ops measures graph building; honest per-region timing needs a
-      `mx.synchronize()` that itself perturbs the schedule. Prefer therefore: run matched cold
-      prefills at 52 k and 104 k while varying one knob from step 1 at a time (top-k budget, compress
-      ratio, eager vs tiled selection), and read the *row* fields shipped today
-      (`prompt_suffix_time_s`, `prompt_eval_time_s`, `new_prefill_tokens`). If a knob moves the
-      per-token cost, that region owns the term. Only if no knob is decisive, add an env-gated
-      synchronizing timer inside the layer, and report the flag-off versus flag-on totals so the
-      instrument's own cost is on the record.
-- [ ] **Step 3 — decide the fix from step 2's attribution.** Three candidate shapes, chosen by
-      evidence rather than preference: (a) block-align the KV so the gather reads contiguous blocks
-      and a paged kernel can serve the selected set -- this is where wiring `QSACache` into the paged
-      install would belong, and it must keep `raw_keys`/`pooled` positional semantics, `trim(n)` for
-      speculative rollback, and the `state` round-trip intact; (b) make the selection cheaper (pooled
-      layout, threshold, or tiling) if step 2 puts the term there; (c) accept the curve and hold
-      context client-side under ~60 k, which is what criterion 5 already names as the honest outcome.
-      Record the choice and its evidence in this plan before writing product code.
-- [ ] **Step 4 — acceptance, measured on the serve harness.** Cold 103 k prefill <= 134 s
-      (criterion 4) and follow-up <= 1.40 s as the median of >= 3 runs (criterion 3), on a fresh
-      server with an emptied bank, with `prefill_layout` / `prefill_attention_impl` and the four
-      prompt-breakdown keys present on the rows so the win is attributable and not inferred. Plus:
-      the 15 request-observability goldens unchanged except for declared additions, and a full
-      `pytest tests/` at exit 0. If step 3 chooses (c), the acceptance is the doc change that closes
-      criteria 3-5 with the client-side bound and the measurements behind it -- not a code change.
+- [x] **Step 1 — DONE 2026-09-06 23:30, and it found the gate rather than a knob list.** The QSA
+      prefill pipeline is gated by `_qsa_prefill_enabled()` (`models/qwen4_exp.py:1480`), AUTO by
+      default, resolving through `qsa_prefill_lane_auto_supported()` (`:1439`). Probing those in the
+      serving venv returned `nax_available False`, `lane_auto_supported False`,
+      `_qsa_prefill_enabled False`, with the engine's own diagnostic: `QSA sparse prefill disabled:
+      this Metal SDK cannot compile the MPP score pipeline; using dense prefill`. The auto gate has
+      exactly two fast consumers (`:1440-1453`): the Metal 4 TensorOps (NAX) flash kernel, which is
+      M4/M5-only, and -- for M3-class GPUs, which have no G17 tensor units -- the vendored **Steel
+      sparse-GQA** kernel "when it is built and probed". Neither was available, because:
+      `_IMPORT_ERROR = ModuleNotFoundError("No module named 'mtplx_qsa_kernels'")`. The extension
+      ships in this tree at `native_extensions/qsa_kernels` (oMLX PR #3244, Apache-2.0) with
+      `CMakeLists.txt`, `setup.py`, `.metal` source and a README; its artifacts are gitignored, so a
+      clone never carries them and no boot path warns that the fast lane is off. Knobs enumerated on
+      the way, all read at gate time: `MTPLX_QSA_PREFILL` (master, auto),
+      `MTPLX_QSA_PREFILL_MIN_ROWS` 32, `_MIN_CONTEXT` / `_FLASH_MIN_CONTEXT` / `_DIRECT_MIN_CONTEXT`
+      32768, `MTPLX_QSA_GATHER` / `_GATHER_DECODE` / `_GATHER_MIN_CONTEXT` 16384 / `_GATHER_MAX_ROWS`
+      8, `MTPLX_QSA_FLASH`, `MTPLX_QSA_SCORE_TILE_ROWS`, `MTPLX_FUSED_QSA_INDEXER`,
+      `MTPLX_COMPILED_QSA_INDEXER`; model config `indexer_budget` 2048, `indexer_compress_ratio` 4.
+- [x] **Step 2 — DONE 2026-09-06 23:45 by exactly the ablation this step prescribed.** One
+      variable, `MTPLX_QSA_PREFILL` (auto versus `0`), verified present in the process environment
+      with `ps eww`; matched arms on the side-by-side 9003, same pack / profile / depth / chunk,
+      `--unique-body` so every cold row is genuinely cold, 9001 and 9002 untouched. At 104 k: cold
+      251.33 s / 403.1 tok/s with the lane off versus **104.68 s median of 3 / 968.4 tok/s** with it
+      on (-58.4 % wall, +140.6 % throughput); follow-up 2.79 s versus **1.56 s** median of 3; peak
+      129.8 versus 114.9 GiB. At 52 k the same arms give +21.0 %, so the gain grows with context --
+      the signature of removing a superlinear term, which is what the dense-mask reconstruction was.
+      The cold marginal cost between 50.7 k and 101.3 k falls from 3.8499 to 2.0464 ms/token, and the
+      follow-up still tracks it (ratio 1.138), so the prompt-breakdown conclusion survives the fix.
+      No stopwatch inside the layer was needed and no synchronizing timer was added.
+- [x] **Step 3 — resolved 2026-09-06 23:45 by a fourth option this step did not list.** None of
+      (a) block-aligning the KV, (b) cheapening the selection, (c) holding context client-side was
+      needed: the sparse selection already existed and was merely **not compiled**. The fix is a
+      build, not a code change -- `uv pip install "nanobind==2.15.0" "setuptools>=42"` into the
+      serving venv (the extension pins nanobind exactly; a mismatch imports cleanly and then rejects
+      every `mx.array`, oMLX #2139), then `setup.py build_ext --inplace`, whose artifacts
+      `qsa_prefill_direct.py:116-130` finds on its own. Proof: `BUILT_AGAINST_MLX 0.32.2` equals the
+      imported mlx, `BUILT_AGAINST_NANOBIND 2.15.0`, `preflight pipeline ok: True`,
+      `_qsa_prefill_enabled(): True`, `otool -L` resolving `@rpath/libmlx.dylib`, repo tree still
+      clean. Two linker warnings recorded rather than hidden: a missing
+      `/Applications/Xcode_26.6.app/...` framework search path, and "building for macOS-15.0, but
+      linking with dylib `@rpath/libmlx.dylib` which was built for newer version 26.2". Options (a)
+      and (b) stay unexplored and are now lower value; (c) is no longer the honest outcome for
+      criterion 4. Recorded in this plan before any product code was written, as the step required.
+- [ ] **Step 4 — PARTLY met 2026-09-06 23:45; open on criterion 3 and on durability.** Criterion 4
+      is met: cold 103 k **104.68 s median of 3** against the 134 s target (267.920 s baseline).
+      Criterion 3 is not: follow-up **1.56 s median of 3** against a 1.40 s target, 11.4 % above,
+      though that is -44.4 % from the 2.805 s baseline. Still open here: (i) 9001 and 9002 are
+      running processes started before the build, so they still have the lane off and pick it up only
+      at their next restart; (ii) nothing at boot warns when the extension is missing, so a fresh
+      clone or a rebuilt venv silently returns to the slow curve -- a doctor or wrapper check is the
+      obvious follow-up and is not built; (iii) two pre-existing defects surfaced by the measurement
+      and belong in their own slices: an identical repeat request 500s at `qwen4_fixed_verify.py:269`
+      (`qwen4 fixed-M4 prompt history does not match the prefetched cache`, check introduced by
+      `d6018d2`, ported from PR #391 -- and a repeat is a retry-shaped request), and a diverging
+      continuation restores from a snapshot trimmed to 94 208 of 101 305 tokens and so re-prefills
+      ~7.7 k tokens (36.57 s and 26.90 s measured, against 1.56 s for a continuation that extends
+      the chain).
 
 Known risks for (a), stated up front because they are the ones that will bite: the paged install's
 contract is `keys`/`values` on the entry (`cache_state.py` install loop), which `QSACache` does not

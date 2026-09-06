@@ -420,3 +420,132 @@ Swap note bearing on criterion 7 of the prefill issue: 72.56 MiB with the 9001+9
 The criterion is written for the pair; a third Flash-Next pack is outside its scope, and the reading
 is recorded here rather than left in a shell scrollback.
 
+## The QSA sparse prefill lane was never built on this machine — building it is the fix
+
+2026-09-06 23:45. **Cold 103 k prefill: 251.33 s -> 104.68 s median (-58.4 % wall, +140.6 %
+throughput). Follow-up at 101 k: 2.79 s -> 1.56 s median (-44.1 %). Peak 129.8 -> 114.9 GiB.** No
+product code changed: a vendored native extension that ships in this tree had never been compiled
+into the serving venv.
+
+### How it was found
+
+Task 7 step 1 went looking for the knobs inside the QSA layer, because `models/qwen4_exp.py:3760-3786`
+gathers selected rows with `mx.take` and runs SDPA on the subset — so the term that grows with
+context had to be the indexer's selection or the gather, not a dense attention. The layer's prefill
+pipeline is gated by `_qsa_prefill_enabled()` (`:1480`), which resolves AUTO through
+`qsa_prefill_lane_auto_supported()` (`:1439`). Probed directly in the serving venv:
+
+```
+nax selector disponibile      : False
+prefill lane auto supported   : False
+producer compile ok           : True
+[mtplx] QSA sparse prefill disabled: this Metal SDK cannot compile the MPP score pipeline;
+                                     using dense prefill (QSA MPP prefill scores called for an
+                                     unsupported signature)
+mpp compile ok                : False
+_qsa_prefill_enabled()        : False
+```
+
+`qsa_prefill_lane_auto_supported` has exactly two fast consumers (`:1440-1453`): the Metal 4
+TensorOps (NAX) flash kernel for M4/M5, and — for M3-class GPUs, which have no G17 tensor units —
+the vendored **Steel sparse-GQA** kernel, "when it is built and probed". Neither was available, so
+the model rode "the eager selector into the dense-mask reconstruction — pure tax", in the docstring's
+own words. The reason the M3 consumer was missing:
+
+```
+_IMPORT_ERROR : ModuleNotFoundError("No module named 'mtplx_qsa_kernels'")
+```
+
+`native_extensions/qsa_kernels/` (vendored from oMLX PR #3244, Apache-2.0) was in the tree, with
+`CMakeLists.txt`, `setup.py`, the `.metal` source and a README — never built. Its artifacts are
+gitignored, so a clone does not carry them and nothing in the boot path warns that the fast lane is
+off.
+
+### The build, exactly as performed
+
+Restore point recorded first: the venv held `nanobind 2.12.0` (dist-info present) and **no**
+setuptools (uv-created venv, no pip). The extension pins `nanobind==2.15.0` exactly — a mismatch
+imports cleanly and then rejects every `mx.array` (oMLX #2139) — and `mlx==0.32.2`, which the venv
+already had.
+
+```sh
+uv pip install --python .venv/bin/python "nanobind==2.15.0" "setuptools>=42"
+cd native_extensions/qsa_kernels && ../../.venv/bin/python setup.py build_ext --inplace
+```
+
+Two linker warnings, recorded rather than hidden: a missing framework search path
+(`/Applications/Xcode_26.6.app/...`) and "building for macOS-15.0, but linking with dylib
+`@rpath/libmlx.dylib` which was built for newer version 26.2". Proof per the extension's README:
+
+```
+BUILT_AGAINST_MLX     : 0.32.2      imported_mlx: 0.32.2   (receipt matches)
+BUILT_AGAINST_NANOBIND: 2.15.0
+preflight pipeline ok : True
+lane auto supported   : True
+_qsa_prefill_enabled  : True
+otool -L _ext*.so     : @rpath/libmlx.dylib, @rpath/libmtplx_qsa_kernel_ops.dylib  (no build-tree path)
+```
+
+`qsa_prefill_direct.py:116-130` finds the in-place artifacts itself, so no install into site-packages
+is needed. Repo stayed clean (`git status --porcelain` empty): `.so`, `.dylib`, `.metallib` and
+`build/` are gitignored.
+
+### A/B, matched, same session, side-by-side 9003
+
+Arms differ only by `MTPLX_QSA_PREFILL` (verified present in the process environment with
+`ps eww`): arm A auto (lane on), arm B `=0` (kill switch). Same pack, profile turbo, depth 3, chunk
+2048, `--unique-body` so every cold row is genuinely cold. 9001/9002 untouched throughout.
+
+| rung | arm | cold eval_s | cold tok/s | follow-up eval_s | follow-up tok/s | peak GiB |
+|---|---|---|---|---|---|---|
+| 52 k | B (lane off) | 68.35 | 742.0 | 1.86 | 363.3 | 117.5 |
+| 52 k | **A (lane on)** | **56.24** | **902.0** | **1.47** | **460.4** | 114.9 |
+| 104 k | B (lane off) | 251.33 | 403.1 | 2.79 | 241.6 | 129.8 |
+| 104 k | **A (lane on)**, median of 3 | **104.68** | **968.4** | **1.56** | **431.1** | 114.9-134.9 |
+
+Arm A at 104 k, all three runs: cold 106.46 / 104.68 / 104.50 s (spread 1.87 %), follow-up
+1.56 / 1.56 / 1.56 s. Arm B reproduces the lane-off run from earlier the same evening (256.68 s /
+394.9 tok/s at 22:46 vs 251.33 s / 403.1 now, 2 % apart), so the single B run is not a lucky draw.
+
+| effect | 52 k | 104 k |
+|---|---|---|
+| cold throughput | +21.0 % | **+140.6 %** |
+| cold wall | -17.7 % | **-58.4 %** |
+| follow-up wall | -21.0 % | **-44.1 %** |
+| peak memory | -2.6 GiB | -14.9 GiB |
+
+The gain grows with context, which is the signature of removing a superlinear term: the cold marginal
+cost between 50.7 k and 101.3 k falls from 3.8499 to **2.0464 ms/token**, and the follow-up still
+tracks it (4.1018/3.8499 = 1.065 before, 2.3284/2.0464 = **1.138** after) — the D1 conclusion holds
+on the faster curve, so criteria 3 and 4 remain one fix rather than two.
+
+### Criterion verdicts for the prefill issue
+
+- **Criterion 4 (cold 103 k <= 134 s): MET.** 104.68 s median of 3, against a 267.92 s baseline.
+- **Criterion 3 (follow-up <= 1.40 s median of >= 3): open, but 1.56 s against a 2.805 s baseline**
+  — 11.4 % above target. The curve bent; it did not flatten.
+- Criterion 5 (paged lane) is untouched by this: the paged lane is still unreachable by construction,
+  and the win came from a different lane entirely.
+
+### Two defects found while measuring, both pre-existing
+
+1. **An identical repeat request 500s.** Re-sending the same conversation (whole prompt cached, zero
+   new tokens) raises `ValueError: qwen4 fixed-M4 prompt history does not match the prefetched
+   cache` at `qwen4_fixed_verify.py:269`, reached from `graphbank.py:2015 install_fixed_m4`. The
+   check compares the n-gram sidecar's last two tokens with the prompt tail; the sidecar is left
+   advanced by the previous generation and nothing re-aligns it when there is no suffix. The check
+   comes from `d6018d2` (ported from PR #391), not from this session's work. This is a retry-shaped
+   request, so clients can hit it in normal use.
+2. **A diverging continuation pays for a trimmed snapshot.** The stored snapshot for a 101 k prompt
+   restores at **94 208** tokens, not 101 305, so a follow-up whose text diverges from the stored
+   chain re-prefills ~7.7 k tokens: 36.57 s and 26.90 s measured, against 1.56 s for a continuation
+   that extends the chain. Rows: `~/.mtplx/logs/request-log-9003.jsonl`, artifacts
+   `~/.mtplx/bench/prefill-probe-9003-qsa{A,A2,A3,B}-*.json`.
+
+### What is not done
+
+9001 and 9002 are still running processes started **before** the build, so they still have the lane
+off; they pick it up at their next restart. Nothing in the boot path warns when the extension is
+missing, so a fresh clone silently returns to the slow curve — a doctor/wrapper check is the obvious
+follow-up, and it is not built yet.
+
