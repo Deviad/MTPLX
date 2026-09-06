@@ -13,6 +13,8 @@ set -uo pipefail
 #     is the suite that caught the health check resolving mtplx from the caller's
 #     cwd and blessing a broken venv; no fake reproduced it.
 # P - the rc PATH line: absent / already in front / appended-behind / commented.
+# S - the measurement scripts: install / idempotence / --check / checkout moved on /
+#     hand-edited copy / a checkout that carries none of them.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/scripts/install_repo_launcher.sh"
@@ -217,14 +219,20 @@ mkdir -p $T/q/.mtplx/bin; : > $T/q/.zshrc
 LK=$T/q/.mtplx/bin/mtplx
 printf '#!/bin/sh\nprintf "banner spazzatura\\n"; printf "%s\\n"\n' "$LK" > $T/sh_ok
 printf '#!/bin/sh\nprintf "/some/other/mtplx\\n"\n' > $T/sh_bad
+printf '#!/bin/sh\nprintf "alias mtplx=%s\\n"\n' "$LK" > $T/sh_alias
+printf '#!/bin/sh\nprintf "alias mtplx=/some/other/mtplx\\n"\n' > $T/sh_alias_bad
 printf '#!/bin/sh\nprintf "nothing here\\n"\n' > $T/sh_none
 printf '#!/bin/sh\nsleep 30\n' > $T/sh_slow
-chmod +x $T/sh_ok $T/sh_bad $T/sh_none $T/sh_slow
+chmod +x $T/sh_ok $T/sh_bad $T/sh_none $T/sh_slow $T/sh_alias $T/sh_alias_bad
 q() { HOME=$T/q MTPLX_HOME=$T/q/.mtplx MTPLX_RC=$T/q/.zshrc MTPLX_NO_SHELL_PROBE= MTPLX_LOGIN_SHELL="$1" bash $T/repo/scripts/install_repo_launcher.sh "${@:2}"; }
 
 out=$(q "$T/sh_ok"); echo "$out" | grep -q "shell probe: zsh runs $LK" && ok "shell risolve il nostro launcher -> nessun allarme" || no "allineato: $out"
 out=$(q "$T/sh_bad" --check); rc=$?
 { [ $rc = 1 ] && echo "$out" | grep -q 'NOT '; } && ok "un mtplx altrui vincente => drift + exit 1" || no "rc=$rc :: $out"
+# La forma alias di zsh: `command -v` risponde `alias mtplx=/path`, non il path.
+out=$(q "$T/sh_alias"); echo "$out" | grep -q "shell probe: zsh runs $LK" && ok "alias che punta al nostro launcher => nessun drift" || no "alias frainteso: $out"
+out=$(q "$T/sh_alias_bad" --check); rc=$?
+{ [ $rc = 1 ] && echo "$out" | grep -q 'NOT '; } && ok "alias altrui => drift + exit 1" || no "rc=$rc :: $out"
 out=$(q "$T/sh_none" --check)
 echo "$out" | grep -q 'did not resolve' && ok "probe inconcludente dichiarato tale" || no "inconcludente: $out"
 echo "$out" | grep -q 'NOT ' && no "inconcludente non deve diventare drift" || ok "inconcludente != drift"
@@ -314,6 +322,75 @@ printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/B-real-uv.result"
 rm -rf $B
 }
 
+suite_S() {
+T=$RUNDIR/S; rm -rf $T; mkdir -p $T/home/.mtplx $T/uvbin
+H=$T/healthy; export UVLOG=$T/uvargs HEALTHFILE=$H
+P=0;F=0; ok(){ echo "  OK   $1"; P=$((P+1)); }; no(){ echo "  FAIL $1"; F=$((F+1)); }
+NAMES="prefill_probe.py prefill_lane_sweep.py followup_repeat.py suffix_width_sweep.py prefill_ladder_baseline.sh"
+mtime(){ stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+mkrepo(){ local r=$1; mkdir -p $r/.venv/bin $r/scripts
+  printf '#!/bin/sh\necho "mtplx-fixture 1.0"\n' > $r/.venv/bin/mtplx; chmod +x $r/.venv/bin/mtplx
+  cat > $r/.venv/bin/python3 <<SHIM
+case "\$*" in
+  *mlx.core*) echo "0.9.9-shim"; exit 0 ;;
+  *import*mtplx*) [ -f "$H" ] && exit 0 || exit 1 ;;
+esac
+exit 0
+SHIM
+  chmod +x $r/.venv/bin/python3; cp "$SRC" $r/scripts/install_repo_launcher.sh
+  local n; for n in $NAMES; do printf '#!/usr/bin/env python3\n# fixture %s\n' "$n" > $r/scripts/$n; done; }
+printf '#!/bin/sh\nexit 0\n' > $T/uvbin/uv; chmod +x $T/uvbin/uv; export PATH=$T/uvbin:$PATH
+: > $H; mkrepo $T/repo
+S=$T/home/.mtplx/scripts
+q(){ HOME=$T/home MTPLX_HOME=$T/home/.mtplx bash $T/repo/scripts/install_repo_launcher.sh "$@" 2>&1; }
+
+echo "=== S1 installazione: cinque copie byte-identiche + manifest ==="
+out=$(q); rc=$?
+[ $rc = 0 ] && ok "exit 0" || no "rc=$rc :: $out"
+[ "$(ls -1 $S | grep -c '\.')" = 5 ] && ok "5 script installati" || no "file: $(ls -1 $S)"
+[ "$(grep -vc '^#' $S/.repo-scripts.tsv)" = 5 ] && ok "manifest con 5 righe" || no "manifest assente o corto"
+ident=1; for n in $NAMES; do cmp -s $T/repo/scripts/$n $S/$n || ident=0; done
+[ $ident = 1 ] && ok "copie byte-identiche al checkout" || no "una copia differisce"
+# BSD chmod rifiuta `--`: con set -e una catena `cp && chmod +x -- f` abortiva
+# dopo la prima copia, quindi il permesso e' parte del contratto, non un dettaglio.
+[ -x $S/prefill_probe.py ] && ok "copie eseguibili" || no "non eseguibile"
+
+echo "=== S2 idempotenza ==="
+out=$(q); [ "$(echo "$out" | grep -c 'up to date')" = 5 ] && ok "5x up to date" || no "$out"
+
+echo "=== S3 --check allineato: nessun drift, nessuna scrittura ==="
+m1=$(mtime $S/.repo-scripts.tsv)
+out=$(q --check)
+echo "$out" | grep -qE 'is not installed|behind the checkout|was not installed by us' \
+  && no "drift inventato: $out" || ok "nessun drift sugli script"
+m2=$(mtime $S/.repo-scripts.tsv)
+[ "$m1" = "$m2" ] && ok "--check non riscrive il manifest" || no "manifest riscritto"
+
+echo "=== S4 il checkout va avanti: --check lo nomina, il run aggiorna ==="
+printf '# nuova riga\n' >> $T/repo/scripts/prefill_probe.py
+out=$(q --check); echo "$out" | grep -q 'behind the checkout' && ok "--check nomina il ritardo" || no "$out"
+out=$(q); echo "$out" | grep -q 'updated prefill_probe.py' && ok "il run aggiorna" || no "$out"
+cmp -s $T/repo/scripts/prefill_probe.py $S/prefill_probe.py && ok "copia di nuovo identica" || no "differisce ancora"
+
+echo "=== S5 contenuto forestiero: niente sovrascrittura senza --force ==="
+printf '# edit a mano\n' >> $S/followup_repeat.py
+out=$(q); echo "$out" | grep -q 'was not installed by us' && ok "riconosce il forestiero" || no "$out"
+grep -q 'edit a mano' $S/followup_repeat.py && ok "preservato senza --force" || no "sovrascritto senza --force"
+out=$(q --force); grep -q 'edit a mano' $S/followup_repeat.py && no "--force non ha sostituito" || ok "--force sostituisce"
+
+echo "=== S6 checkout senza i cinque script: skip dichiarato, non drift ==="
+mkrepo $T/repo2
+for n in $NAMES; do rm -f $T/repo2/scripts/$n; done
+mkdir -p $T/home2/.mtplx
+out=$(HOME=$T/home2 MTPLX_HOME=$T/home2/.mtplx bash $T/repo2/scripts/install_repo_launcher.sh 2>&1); rc=$?
+[ $rc = 0 ] && ok "exit 0" || no "rc=$rc :: $out"
+echo "$out" | grep -q 'carries none of the measurement scripts' && ok "dichiara lo skip" || no "$out"
+[ -x $T/home2/.mtplx/bin/mtplx ] && ok "launcher installato lo stesso" || no "launcher mancante"
+[ "$(ls -1 $T/home2/.mtplx/scripts 2>/dev/null | grep -c '\.')" = 0 ] && ok "nessuno script installato" || no "script installati"
+
+printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/S-scripts.result"; rm -rf $T
+}
+
 run_suite() {
   local name=$1 fn=$2
   printf '\n########## %s ##########\n' "$name"
@@ -326,6 +403,7 @@ run_suite() {
 
 run_suite A-mechanism suite_A
 run_suite P-path suite_P
+run_suite S-scripts suite_S
 if [ "$with_real" = 1 ]; then
   if command -v uv >/dev/null 2>&1; then
     run_suite B-real-uv suite_B

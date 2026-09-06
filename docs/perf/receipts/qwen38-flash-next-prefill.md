@@ -549,3 +549,25 @@ off; they pick it up at their next restart. Nothing in the boot path warns when 
 missing, so a fresh clone silently returns to the slow curve — a doctor/wrapper check is the obvious
 follow-up, and it is not built yet.
 
+## Where the instruments behind these numbers live now (2026-09-07 00:38)
+
+Every measurement in this receipt was produced by tools that used to exist only in the operator's
+`~/.mtplx/scripts/`, outside version control. They are now in this checkout, and
+`scripts/install_repo_launcher.sh` installs them byte-identical into `$MTPLX_HOME/scripts` with a
+sidecar manifest (`.repo-scripts.tsv`) so drift is visible and a hand-edited copy is never
+overwritten without `--force`:
+
+| in this repo | what it produces | earlier name in the lines above |
+|---|---|---|
+| `scripts/prefill_probe.py` | the cold + follow-up rows per rung, read from `$MTPLX_HOME/logs/request-log-<port>.jsonl` | `~/.mtplx/scripts/prefill-probe.py` |
+| `scripts/prefill_lane_sweep.py` | the three-arm interleaved lane sweep (`prefill_layout`, `prefill_attention_impl`) | `~/.mtplx/scripts/prefill-lane-sweep.py` |
+| `scripts/followup_repeat.py` | the extra follow-up runs a median of >= 3 needs | `~/.mtplx/scripts/followup-repeat.py` |
+| `scripts/suffix_width_sweep.py` | per-token cost against requested suffix width | `~/.mtplx/scripts/d1-suffix-width-sweep.py` |
+| `scripts/prefill_ladder_baseline.sh` | the in-process ladder baseline | same name |
+
+The historical references above keep the names they were run under; the artifacts they cite
+(`~/.mtplx/bench/*.json`, `~/.mtplx/logs/request-log-*.jsonl`) are unchanged. Nothing in these five
+carries a credential or a non-loopback URL, and none hardcodes an absolute path: the root is
+`$MTPLX_HOME` (default `$HOME/.mtplx`) and ports, wrappers and model directories are arguments.
+Checked before publishing, not assumed: `scripts/hygiene_scan.sh` exit 0 with all five present.
+

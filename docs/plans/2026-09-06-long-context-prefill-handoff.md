@@ -530,13 +530,17 @@ the only tool that can drive *my own* wrappers' ports with a per-port session ba
       survives `mtplx stop`, so a cold row needs a fresh server or an emptied bank; and the engine
       will not answer `gen_config` unless the served id matches `--model-id`, which is why the
       side-by-side port had to name itself `mtplx-flash-next`.
-- [ ] **Step 3 (still open, and now more expensive to close):** the ladder rows do carry
-      `cached_tokens`/`new_prefill_tokens`, so the `kind` derivation could be ported -- but the
-      external tool has become load-bearing rather than incidental: `prefill-probe.py` is what reads
-      engine rows out of `~/.mtplx/logs/request-log-<port>.jsonl`, and the 2026-09-06 lane sweep
-      (`~/.mtplx/scripts/prefill-lane-sweep.py`) is built on exactly that channel to read
-      `prefill_layout`/`prefill_attention_impl` per cold row. Either port the engine-row reader into
-      `prefill_bench` too, or drop this box and keep the two tools deliberately separate.
+- [x] **Step 3 — closed by decision on 2026-09-07, and the decision is NOT the porting this step
+      asked for.** The row-kind logic was never moved into `prefill_bench`, and it should not be:
+      what made the external tool a liability was that it lived outside version control, not that it
+      was a second program. As of 2026-09-07 all five instruments are in this checkout
+      (`scripts/prefill_probe.py`, `prefill_lane_sweep.py`, `followup_repeat.py`,
+      `suffix_width_sweep.py`, `prefill_ladder_baseline.sh`) and `install_repo_launcher.sh` installs
+      them byte-identical into `$MTPLX_HOME/scripts` with a sidecar manifest, so the ladder and the
+      probe are versioned siblings reviewed together instead of a repo tool plus an unversioned one.
+      The two stay deliberately separate on purpose: the ladder measures in-process, the probe reads
+      the engine rows a live server emits, and the receipt's numbers need both. If someone later
+      ports the row-kind derivation anyway, this box is where the reason not to is recorded.
 - [x] **Step 4:** committed with the harness work (`a04460d`) and the receipt updates (`98f8604`).
 
 ### Task 6 — D5 honest reporting

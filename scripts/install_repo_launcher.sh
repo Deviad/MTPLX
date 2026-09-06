@@ -288,6 +288,20 @@ if [ "${MTPLX_NO_SHELL_PROBE:-0}" != 1 ]; then
     # `|| true`: under set -euo pipefail a pipeline whose grep finds nothing returns
     # 1, which would abort the whole script on an inconclusive probe.
     resolved=$(timeout 12 "$probe_bin" -lic 'command -v mtplx' 2>/dev/null | grep -E '/mtplx$' | tail -1) || true
+    # zsh answers `command -v mtplx` with `alias mtplx=/path/to/mtplx` when an
+    # alias exists; bash answers with the bare path. Compare the path, not the
+    # shell's phrasing -- otherwise an installed alias, which is the normal
+    # state after this script runs, reads as drift forever and `--check` can
+    # never return 0. (Measured on the operator's zsh: the alias pointed at
+    # exactly this launcher and the probe still said NOT.)
+    case "$resolved" in
+      alias\ *=*)
+        resolved="${resolved#alias }"
+        resolved="${resolved#*=}"
+        ;;
+    esac
+    resolved="${resolved%\"}"; resolved="${resolved#\"}"
+    resolved="${resolved%\'}"; resolved="${resolved#\'}"
     if [ -z "$resolved" ]; then
       printf 'shell probe: %s did not resolve `mtplx` (rc noise, timeout, or not on PATH)\n' "$shell_name"
     elif [ "$resolved" = "$launcher" ]; then
@@ -321,6 +335,115 @@ else
     printf 'activate it: source %s\n' "$rc"
   fi
 fi
+
+# --- 4. the measurement scripts: byte-identical copies + a sidecar manifest --
+# The instruments behind docs/perf/receipts/qwen38-flash-next-prefill.md live in
+# this checkout so they are versioned and reviewed. The operator's copies under
+# $MTPLX_HOME/scripts are installed from there BYTE-IDENTICAL: no provenance
+# header is injected into them, so `diff` against the checkout stays meaningful,
+# and the provenance lives in a sidecar manifest instead. Three states per file,
+# the same discipline as the launcher -- missing, behind (the checkout moved on,
+# so updating it is ours to do), or foreign (edited by hand, so it is not ours to
+# overwrite without --force).
+#
+# A checkout carrying none of them is NOT drift: this section is about the
+# operator's copies, and a partial or unrelated checkout still installs a
+# working launcher.
+scripts_dir="${MTPLX_HOME:-$HOME/.mtplx}/scripts"
+scripts_manifest="$scripts_dir/.repo-scripts.tsv"
+repo_scripts=(
+  prefill_probe.py
+  prefill_lane_sweep.py
+  followup_repeat.py
+  suffix_width_sweep.py
+  prefill_ladder_baseline.sh
+)
+
+blob_sha() { git -C "$repo" hash-object -- "$1" 2>/dev/null; }
+
+manifest_sha() {
+  [ -f "$scripts_manifest" ] || return 0
+  awk -F '\t' -v n="$1" '$1 == n { print $2; exit }' "$scripts_manifest" 2>/dev/null
+}
+
+install_repo_scripts() {
+  if ! command -v git >/dev/null 2>&1; then
+    printf 'scripts: git is needed to compare the copies -- skipping\n'
+    return 0
+  fi
+  local present=0 name
+  for name in "${repo_scripts[@]}"; do
+    [ -f "$repo/scripts/$name" ] && present=$((present + 1))
+  done
+  if [ "$present" = 0 ]; then
+    printf 'scripts: this checkout carries none of the measurement scripts -- skipping\n'
+    return 0
+  fi
+  if ! mkdir -p -- "$scripts_dir" 2>/dev/null; then
+    printf 'scripts: cannot create %s -- skipping\n' "$scripts_dir" >&2
+    drift=1
+    return 0
+  fi
+  local tmp src dst src_sha dst_sha rec_sha
+  tmp="$(mktemp)"
+  for name in "${repo_scripts[@]}"; do
+    src="$repo/scripts/$name"
+    dst="$scripts_dir/$name"
+    if [ ! -f "$src" ]; then
+      printf 'scripts: %s is on the install list but not in the checkout\n' "$name" >&2
+      drift=1
+      continue
+    fi
+    src_sha="$(blob_sha "$src")"
+    rec_sha="$(manifest_sha "$name")"
+    if [ ! -f "$dst" ]; then
+      drift=1
+      if [ "$check_only" = 1 ]; then
+        printf 'scripts: %s is not installed (--check: would install)\n' "$name"
+      else
+        cp -- "$src" "$dst" && chmod +x "$dst" 2>/dev/null
+        printf 'scripts: installed %s\n' "$name"
+      fi
+    else
+      dst_sha="$(blob_sha "$dst")"
+      if [ "$dst_sha" = "$src_sha" ]; then
+        printf 'scripts: %s up to date\n' "$name"
+      elif [ -n "$rec_sha" ] && [ "$dst_sha" = "$rec_sha" ]; then
+        drift=1
+        if [ "$check_only" = 1 ]; then
+          printf 'scripts: %s is behind the checkout (--check: would update)\n' "$name"
+        else
+          cp -- "$src" "$dst" && chmod +x "$dst" 2>/dev/null
+          printf 'scripts: updated %s from the checkout\n' "$name"
+        fi
+      else
+        drift=1
+        printf 'scripts: %s differs from the checkout and was not installed by us\n' "$name"
+        printf '         installed: %s\n' "$dst"
+        printf '         checkout:  %s\n' "$src"
+        if [ "$force" = 1 ] && [ "$check_only" != 1 ]; then
+          cp -- "$src" "$dst" && chmod +x "$dst" 2>/dev/null
+          printf '         --force: replaced with the checkout copy\n'
+        else
+          printf '         nothing overwritten -- rerun with --force to take it over\n'
+        fi
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "$src_sha" "scripts/$name" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$tmp"
+  done
+  if [ "$check_only" != 1 ] && [ -s "$tmp" ]; then
+    {
+      printf '# measurement scripts installed by scripts/install_repo_launcher.sh\n'
+      printf '# source checkout: %s\n' "$repo"
+      printf '# name\tsha\trepo-path\tinstalled-at\n'
+      cat -- "$tmp"
+    } >"$scripts_manifest"
+  fi
+  rm -f -- "$tmp"
+}
+
+install_repo_scripts
 
 if [ "$check_only" = 1 ]; then
   if [ "$drift" = 1 ]; then
