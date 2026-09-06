@@ -721,8 +721,14 @@ def test_generation_exact_route_has_fixed_m2_m1_schedule_without_generic_repair(
     # The env gate lives behind PR #208's _skip_verify_snapshot() helper now
     # (same env, plus the recurrent-cache loud-failure guard); the invariant —
     # snapshot handling only on the non-compiled route — is unchanged.
+    # Asserted against the call as it is actually written (bare `if
+    # _skip_verify_snapshot():` exists in no version of this file, including
+    # upstream/main, so the old literal could never match): the guard is conjoined with
+    # the family capture-commit flag, and the route check must still precede it.
+    _snapshot_gate = "if _skip_verify_snapshot() and not family_capture_commit_active:"
+    assert _snapshot_gate in snapshot_block, "snapshot gate moved or changed shape"
     assert snapshot_block.index("if a3b_target_prefix_route is None:") < (
-        snapshot_block.index("if _skip_verify_snapshot():")
+        snapshot_block.index(_snapshot_gate)
     )
     assert "verify_logits, verify_hidden, a3b_primary_state = (" in source
     assert draft_sample_start < exact_verify_start < target_sample_start

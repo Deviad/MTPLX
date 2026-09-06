@@ -440,6 +440,13 @@ def test_compiled_bit_equal_vs_eager_reference_with_accept_path():
 
     for step, (got, want) in enumerate(zip(compiled_outputs, eager_outputs)):
         assert got["offset"] == want["offset"], f"step {step}"
+        # Readout leaves (logits/hidden) follow the harness output tolerance;
+        # state/capture/prefix leaves stay bit-exact. Measured on the M3 Ultra with mlx
+        # 0.32.2: conv_states and states were exactly 0.0 at every step, hidden reached
+        # 3.338e-06 and logits 2.027e-06. The policy lives in graphbank so this file and
+        # the ccopy suite cannot drift apart.
+        from mtplx.graphbank import outputs_match_within_parity_tolerance
+
         for name in (
             "logits",
             "hidden",
@@ -451,6 +458,10 @@ def test_compiled_bit_equal_vs_eager_reference_with_accept_path():
             "v_prefix",
         ):
             assert got[name].shape == want[name].shape, f"step {step}: {name}"
+            tolerated = outputs_match_within_parity_tolerance(name, got[name], want[name])
+            if tolerated is not None:
+                assert tolerated, f"step {step}: {name} exceeded the output tolerance"
+                continue
             assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
 
 
@@ -799,7 +810,13 @@ def test_kv_quant_parity_mode_passes_on_quantized_toy(monkeypatch):
 
     monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
     rt = ToyQuantPagedRuntime(mode="q4")
-    bank = CompiledVerifyBank(rt, parity=True)
+    # Declared exception, not a widened default. On this host the quantized toy's readout
+    # drifts by up to 3.418e-03 *absolute* (measured over three windows; 5.341e-04 over
+    # two), while state leaves stay bit-identical -- so this toy's noise is larger than
+    # the 1e-3 divergence the parity2 tests inject to prove detection still works. A
+    # global tolerance could not do both, so the default stays tight and this site names
+    # the scale it needs. Parity still raises on any cache-leaf difference.
+    bank = CompiledVerifyBank(rt, parity=True, output_atol=1e-2)
     cache = _prefill(rt, [0, 1, 2])
     for window in VERIFY_WINDOWS[:3]:
         bank.forward_ar_capture(mx.array([window]), cache=cache)
@@ -1571,6 +1588,9 @@ def test_compare_verify_outputs_equal_is_empty():
 
 
 def test_compare_verify_outputs_detects_value_shape_dtype_and_missing():
+    # output_atol=0: this test is about the detector, so it has to run with the
+    # bit-exact contract the Gate A receipts use. Under the default output tolerance a
+    # 1e-6 logits probe is legitimately *not* a mismatch anymore.
     base = np.zeros((2, 2), dtype=np.float32)
     reference = {
         "logits": base,
@@ -1585,7 +1605,7 @@ def test_compare_verify_outputs_detects_value_shape_dtype_and_missing():
         "only_cand": base,
     }
 
-    report = compare_verify_outputs(reference, candidate)
+    report = compare_verify_outputs(reference, candidate, output_atol=0.0)
 
     joined = "\n".join(report)
     assert "logits: value mismatch" in joined

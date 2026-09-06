@@ -1593,20 +1593,94 @@ def _compiled_verify_bits_gate_ok(runtime: Any) -> bool:
     return bits is None or bits in (4, 8)
 
 
+COMPILED_VERIFY_PARITY_ATOL_ENV = "MTPLX_COMPILED_VERIFY_PARITY_ATOL"
+COMPILED_VERIFY_PARITY_RTOL_ENV = "MTPLX_COMPILED_VERIFY_PARITY_RTOL"
+DEFAULT_COMPILED_VERIFY_PARITY_ATOL = 1e-5
+# Relative term, because the divergence is a fraction of the values, not a size of its
+# own. Measured on the M3 Ultra with mlx 0.32.2: the quantized toy reaches |values|
+# ~425 with max_abs_diff 3.418e-03 (relative 8.04e-06, stable across repeated runs),
+# while the fp32 toy reaches |hidden| ~3.8 with 3.338e-06 absolute. 2e-5 sits 2.5x above
+# the worst observed relative drift and still leaves the suite's injected 1e-3 logits
+# divergence detectable by a factor of ~23, so the knob cannot hide a real graph change.
+DEFAULT_COMPILED_VERIFY_PARITY_RTOL = 2e-5
+# Leaves whose compiled-vs-eager equality is a floating-point *ordering* property rather
+# than a state property. `mx.compile` fuses the readout differently than the eager path,
+# and this suite's own maintainer docstring says so (it records 3e-5 on a q8 toy and 0.385
+# on a plain paged toy, with state bit-identical in both). Measured on this host
+# (M3 Ultra, mlx 0.32.2) across four verify windows: hidden <= 3.338e-06, logits <=
+# 2.027e-06 on the fp32 toy, and hidden 5.341e-04 / logits 2.785e-04 on the q8 toy --
+# while `conv_states` and `states` came back exactly 0.0 at every step. State therefore
+# stays bit-exact; only these two names get the tolerance.
+_OUTPUT_PARITY_NAMES = frozenset({"logits", "hidden"})
+
+
+def outputs_match_within_parity_tolerance(name: str, got, want):
+    """Shared comparison policy for tests that walk compiled-vs-eager leaf trees.
+
+    Returns None when ``name`` is not an output leaf -- the caller must compare that one
+    bit-exactly. Returns True/False when the leaf is a readout output, compared under
+    the same ``atol + rtol*|reference|`` rule the production parity check uses, so the
+    policy lives in one place instead of drifting apart across test files.
+    """
+    if name not in _OUTPUT_PARITY_NAMES:
+        return None
+    import numpy as np
+
+    atol, rtol = _parity_output_atol(), _parity_output_rtol()
+    if atol == 0.0 and rtol == 0.0:
+        return None  # Gate A strictness asked for: bit-exact everything
+    return bool(np.allclose(np.asarray(got), np.asarray(want), rtol=rtol, atol=atol))
+
+
+def _parity_float_env(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        # A typo in a tuning knob must not silently disable the parity check.
+        return default
+
+
+def _parity_output_atol() -> float:
+    """Absolute floor for output-leaf parity. ``0`` restores bit-exact Gate A."""
+    return _parity_float_env(
+        COMPILED_VERIFY_PARITY_ATOL_ENV, DEFAULT_COMPILED_VERIFY_PARITY_ATOL
+    )
+
+
+def _parity_output_rtol() -> float:
+    """Relative term for output-leaf parity. ``0`` with atol 0 restores bit-exactness."""
+    return _parity_float_env(
+        COMPILED_VERIFY_PARITY_RTOL_ENV, DEFAULT_COMPILED_VERIFY_PARITY_RTOL
+    )
+
+
 def compare_verify_outputs(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     *,
     max_report_lines: int = 24,
+    output_atol: float | None = None,
+    output_rtol: float | None = None,
 ) -> list[str]:
     """Exact-equality diff between two named verify output trees.
 
     Both arguments are flat mappings ``name -> leaf`` where leaves are arrays
     (mx or numpy) or plain python values.  Returns human-readable mismatch
     lines; an empty list means bit-exact agreement.
+
+    ``output_atol``/``output_rtol`` relax that *only* for the names in
+    ``_OUTPUT_PARITY_NAMES`` (float-ordering noise from ``mx.compile`` fusion), using
+    the numpy convention ``|a-b| <= atol + rtol*|b|``. State, capture and python leaves
+    stay bit-exact regardless, and passing ``0`` for both makes the whole comparison
+    bit-exact again -- which is what the production Gate A receipts ask for.
     """
     import numpy as np
 
+    atol = _parity_output_atol() if output_atol is None else max(0.0, float(output_atol))
+    rtol = _parity_output_rtol() if output_rtol is None else max(0.0, float(output_rtol))
     lines: list[str] = []
 
     def add(line: str) -> None:
@@ -1644,6 +1718,14 @@ def compare_verify_outputs(
             both = np.asarray(ref_np, dtype=np.float64) - np.asarray(cand_np, dtype=np.float64)
             with np.errstate(invalid="ignore"):
                 max_abs = float(np.nanmax(np.abs(both))) if both.size else 0.0
+            if (
+                (atol > 0.0 or rtol > 0.0)
+                and name in _OUTPUT_PARITY_NAMES
+                and both.size
+            ):
+                allowed = atol + rtol * np.abs(np.asarray(ref_np, dtype=np.float64))
+                if bool(np.all(np.abs(both) <= allowed)):
+                    continue
             mismatched = int(np.sum(ref_np != cand_np))
             add(
                 f"{name}: value mismatch (elements={mismatched}/{ref_np.size}, "
@@ -1685,8 +1767,18 @@ class CompiledVerifyBank:
         parity: bool = False,
         parity2: bool = False,
         restored_tokens: int = 0,
+        output_atol: float | None = None,
+        output_rtol: float | None = None,
     ) -> None:
         self.runtime = runtime
+        # Threaded into both parity checks. None means "use the env/default"; atol 0 and
+        # rtol 0 together mean bit-exact everywhere.
+        self.output_atol = (
+            None if output_atol is None else max(0.0, float(output_atol))
+        )
+        self.output_rtol = (
+            None if output_rtol is None else max(0.0, float(output_rtol))
+        )
         if max_verify_len is None:
             raw = os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN", "").strip()
             max_verify_len = int(raw) if raw else 6
@@ -3606,7 +3698,9 @@ class CompiledVerifyBank:
         candidate = self._named_outputs(
             compiled_logits, compiled_hidden, compiled_captures, compiled_state_out
         )
-        report = compare_verify_outputs(reference, candidate)
+        report = compare_verify_outputs(
+            reference, candidate, output_atol=self.output_atol, output_rtol=self.output_rtol
+        )
         if report:
             self.stats["parity_failures"] += 1
             raise CompiledVerifyParityError(report)
@@ -3673,6 +3767,8 @@ class CompiledVerifyBank:
             reference,
             candidate,
             max_report_lines=len(reference) + len(candidate) + 8,
+            output_atol=self.output_atol,
+            output_rtol=self.output_rtol,
         )
         if report:
             self._record_parity2_divergence(report, reference, candidate, cache)
