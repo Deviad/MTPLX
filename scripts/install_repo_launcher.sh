@@ -275,6 +275,31 @@ case "$path_state" in
     ;;
 esac
 
+# What the login shell actually runs is the only honest oracle: the rc text can be
+# present and correct and still lose to an earlier PATH entry. Interactive startup
+# prints banners (gitstatus alone emits 13 lines here), so take the last line that
+# looks like an mtplx path, and never let a slow or hanging rc affect the result.
+if [ "${MTPLX_NO_SHELL_PROBE:-0}" != 1 ]; then
+  probe_bin="$shell_name"
+  if [ -n "${MTPLX_LOGIN_SHELL:-}" ]; then
+    probe_bin="$MTPLX_LOGIN_SHELL"
+  fi
+  if command -v "$probe_bin" >/dev/null 2>&1; then
+    # `|| true`: under set -euo pipefail a pipeline whose grep finds nothing returns
+    # 1, which would abort the whole script on an inconclusive probe.
+    resolved=$(timeout 12 "$probe_bin" -lic 'command -v mtplx' 2>/dev/null | grep -E '/mtplx$' | tail -1) || true
+    if [ -z "$resolved" ]; then
+      printf 'shell probe: %s did not resolve `mtplx` (rc noise, timeout, or not on PATH)\n' "$shell_name"
+    elif [ "$resolved" = "$launcher" ]; then
+      printf 'shell probe: %s runs %s\n' "$shell_name" "$resolved"
+    else
+      drift=1
+      printf 'shell probe: %s runs %s -- NOT %s\n' "$shell_name" "$resolved" "$launcher"
+      printf '           a PATH entry ahead of this one wins, so the launcher above is not what you execute\n'
+    fi
+  fi
+fi
+
 if [ "$check_only" = 1 ]; then
   if grep -qE '^alias mtplx=' "$rc" 2>/dev/null; then
     echo "The alias already exists"

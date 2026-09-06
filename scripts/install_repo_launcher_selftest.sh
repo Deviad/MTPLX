@@ -18,6 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$ROOT/scripts/install_repo_launcher.sh"
 [ -f "$SRC" ] || { printf 'expected %s\n' "$SRC" >&2; exit 1; }
 
+export MTPLX_NO_SHELL_PROBE=1   # the oracle reads the real PATH; HOME faking cannot isolate it
 RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/mtplx-selftest.XXXXXX")
 # $TMPDIR arrives with a trailing slash, so mktemp hands back a path containing
 # `//`, and /var is a symlink to /private/var. The launcher normalizes both through
@@ -134,8 +135,7 @@ bash $T/repo2/scripts/install_repo_launcher.sh --check >/dev/null 2>&1
 
 LC_ALL=C grep -q '[^ -~]' "$SRC" && no "non-ASCII" || ok "solo ASCII"
 bash -n "$SRC" && ok "bash -n" || no "sintassi"
-printf "%s
-" "PASS=$P FAIL=$F" > "$RESULT_DIR/A-mechanism.result"; rm -rf $T
+printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/A-mechanism.result"; rm -rf $T
 }
 
 suite_P() {
@@ -212,8 +212,27 @@ out=$(runf $T/h7 "" "" --check); rc=$?
 { [ $rc = 1 ] && echo "$out" | grep -q 'PATH: no'; } && ok "exit 1 + diagnosi" || no "rc=$rc :: $out"
 [ "$Z" = "$(shasum $T/h7/.zshrc|cut -d' ' -f1)" ] && ok "rc intatta in --check" || no "scritto"
 
-printf "%s
-" "PASS=$P FAIL=$F" > "$RESULT_DIR/P-path.result"
+echo "=== Q: oracle della shell di login (shell stub, non la PATH reale) ==="
+mkdir -p $T/q/.mtplx/bin; : > $T/q/.zshrc
+LK=$T/q/.mtplx/bin/mtplx
+printf '#!/bin/sh\nprintf "banner spazzatura\\n"; printf "%s\\n"\n' "$LK" > $T/sh_ok
+printf '#!/bin/sh\nprintf "/some/other/mtplx\\n"\n' > $T/sh_bad
+printf '#!/bin/sh\nprintf "nothing here\\n"\n' > $T/sh_none
+printf '#!/bin/sh\nsleep 30\n' > $T/sh_slow
+chmod +x $T/sh_ok $T/sh_bad $T/sh_none $T/sh_slow
+q() { HOME=$T/q MTPLX_HOME=$T/q/.mtplx MTPLX_RC=$T/q/.zshrc MTPLX_NO_SHELL_PROBE= MTPLX_LOGIN_SHELL="$1" bash $T/repo/scripts/install_repo_launcher.sh "${@:2}"; }
+
+out=$(q "$T/sh_ok"); echo "$out" | grep -q "shell probe: zsh runs $LK" && ok "shell risolve il nostro launcher -> nessun allarme" || no "allineato: $out"
+out=$(q "$T/sh_bad" --check); rc=$?
+{ [ $rc = 1 ] && echo "$out" | grep -q 'NOT '; } && ok "un mtplx altrui vincente => drift + exit 1" || no "rc=$rc :: $out"
+out=$(q "$T/sh_none" --check)
+echo "$out" | grep -q 'did not resolve' && ok "probe inconcludente dichiarato tale" || no "inconcludente: $out"
+echo "$out" | grep -q 'NOT ' && no "inconcludente non deve diventare drift" || ok "inconcludente != drift"
+t0=$(date +%s); out=$(q "$T/sh_slow" --check 2>&1); dt=$(( $(date +%s) - t0 ))
+[ $dt -lt 25 ] && ok "rc lento non appende il check (${dt}s)" || no "appeso: ${dt}s"
+echo "$out" | grep -q 'did not resolve' && ok "timeout gestito come inconcludente" || no "timeout: $out"
+
+printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/P-path.result"
 }
 
 suite_B() {
@@ -291,8 +310,7 @@ echo "=== 4. stabilita' ==="
 bash $R/scripts/install_repo_launcher.sh --check >/dev/null 2>&1; [ $? = 0 ] && ok "--check pulito dopo la riparazione" || no "drift residuo"
 out=$(bash $R/scripts/install_repo_launcher.sh 2>&1)
 echo "$out" | grep -q 'already installed for this checkout' && ok "secondo giro: nessuna riscrittura" || no "ribatte :: $out"
-printf "%s
-" "PASS=$P FAIL=$F" > "$RESULT_DIR/B-real-uv.result"
+printf '%s\n' "PASS=$P FAIL=$F" > "$RESULT_DIR/B-real-uv.result"
 rm -rf $B
 }
 
