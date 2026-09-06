@@ -289,3 +289,75 @@ The hard failure, as opposed to an eager fallback, comes from the fixed-M4 verif
 switched on for this family. Pinning the asymmetry (a two-leaf `None` is fine, a four-leaf one is
 not) is the deliberate part: the fix must populate or defer those leaves, not relax the guard and
 hand the compiled core `None`.
+
+## Task 3 step 2 — the lane seam, unit-proven: four gates, and a counter that does count
+
+2026-09-06 22:06. `tests/test_qwen4_prefill_lane.py`, 13 cases, no weights: synthetic KV at the
+pack's real head shape (`num_attention_heads 24`, `num_key_value_heads 2`, `head_dim 256`,
+`full_attention_interval 4` → 12 `QSACache` layers of 48, read from the pack `config.json`).
+
+Step 1's instrumentation had established that no counted lane fires under either sustained layout
+(`prefill_attention_impl = none` on 9 of 9 sweep rows). Step 2 answers the question that
+instrumentation could not: is the paged lane *unreachable*, or does it run uncounted? Answer:
+unreachable on the served path, by four independent gates, in the order a request meets them.
+
+| # | gate | site | what it does |
+|---|---|---|---|
+| 1 | layout scope | `generation.py` `_target_prefill_cache_layout_scope` | force-zeroes `MTPLX_VLLM_METAL_PAGED_ATTN`, `MTPLX_OWNED_ATTN_KV`, `MTPLX_BLOCK_OWNED_ATTN_KV` while *either* sustained layout is active; `auto` always resolves to one of the two, so `_make_target_prefill_cache` can never install the owned subsystem |
+| 2 | wiring | `cache_state.py` `install_vllm_metal_paged_attention_kv_cache` | converts only entries exposing stock `keys`/`values`; `QSACache` keeps the KV in `.kv` beside positional indexer streams → measured `entries: 0, skipped: 1` with every env on and the inner KV already written |
+| 3 | impl | `cache_state.py` `paged_attention` | the GQA route block runs only under `MTPLX_VLLM_METAL_PAGED_ATTN_IMPL` ∈ {`sdpa_2pass_paged`, `mlx_vector_paged`} and offset ≥ the 1024 two-pass threshold; the serve default sets neither |
+| 4 | route window | `cache_state.py` `_paged_gqa_sdpa_route_decision_from_env` | off by default (`reason: disabled`); default window `min_q 4 … max_q 5` is decode/MTP width, so an 8192-token prefill chunk is refused `q_len_gt_max` even with the route on — no ceiling value can move this counter |
+
+The positive half, which is what makes the zeros a measurement rather than an absence:
+
+| condition (unit level) | observed |
+|---|---|
+| wired + `impl=mlx_vector_paged` + route `auto` + `q_len 4` + offset 2048, phase `prefill` | `gqa_sdpa_calls 1`, `by_route {async_per_head: 1}`, `by_phase {prefill: 1}` |
+| same object, `PARTITIONED_ATTN=1`, `q_len 8192` | `partitioned_paged_calls 1`, `by_phase {prefill: 1}` — the prefill-width owned lane counts per phase |
+| same object, impl unset, `q_len 4` | output correct, `gqa_sdpa_calls 0`, `route_misses {}`, `paged_attention_calls 1` — served by a lane with no counter and no miss; the one place "runs uncounted" is real, and it is *inside* the owned object |
+| route decision, `(24, 24)` heads | `not_gqa` — the gate is shape-aware, not blanket |
+
+Verdict: on the sustained serve path the owned paged subsystem is never constructed for this family,
+so `paged_gqa_sdpa_calls = 0` at every rung is structural. Prefill issue criterion 5 cannot be met
+by tuning on 2.11.x; the branches are client-side session size (under ~60 k, where the measured
+follow-up is 1.22–1.62 s) or wiring `QSACache` into the paged install — a code change with its own
+slice, because the indexer's `raw_keys`/`pooled` streams are positional buffers keyed to `kv.offset`
+and must survive the conversion.
+
+## D1 — follow-up split: the cost is prompt eval, and it is the same curve as cold prefill
+
+2026-09-06 22:06, from `~/.mtplx/bench/prefill-probe-9001-baseline-20260905-222454.json` engine
+rows (not client wall times):
+
+| follow-up at ctx | prompt | cached | new | prompt_eval_s | ttft_s | share of ttft | ms per new token |
+|---|---|---|---|---|---|---|---|
+| 8 150 | 8 150 | 8 150 | **0** | 0.030 | 0.430 | 7 % | — |
+| 27 399 | 27 399 | 26 720 | 679 | 1.495 | 1.516 | 99 % | 2.20 |
+| 53 055 | 53 055 | 52 382 | 673 | 1.901 | 1.931 | 98 % | 2.82 |
+| 104 382 | 104 382 | 103 707 | 675 | 2.835 | 2.896 | 98 % | 4.19 |
+
+Read with the cold column of the same file (7 478 → 987 tok/s; 26 727 → 910; 52 389 → 737;
+103 714 → 386; i.e. 1.014 → 2.590 ms per token, 2.56× from short to long context), this says:
+
+- the follow-up cost is prompt eval, 98–99 % of `ttft_s` on every row that has new tokens; the only
+  cheap follow-up is the one with **zero** new tokens (`cache_source ssd`), while all three paying
+  rows are `cache_source ram`;
+- nothing is re-prefilled beyond what is counted: `generation.py:4020-4021` sets
+  `cached_tokens=restore_point` and `new_prefill_tokens=len(suffix)`, so the reported cached prefix
+  *is* the restore boundary and the reported new count *is* the evaluated span. A 675-token suffix
+  therefore genuinely costs 2.835 s = 238 tok/s against 386 tok/s cold at the same context — 1.6×
+  worse per token;
+- a withdrawn hypothesis, recorded so it is not re-derived: an O(sessions) scan at
+  `session_bank.py:1746` via `get_session` → `_prune_locked`. Neither symbol exists in that file and
+  line 1746 is the boundary-true restore path. The scans that do exist (`_active_session_ids` over
+  `_session_last_active.items()`, `_entries.items()` in the restore/candidate paths) are host-side
+  over maps with a handful of entries — orders of magnitude too small for 2.8 s.
+
+So D1 and D2 are one curve: per-token cost grows with retained context on the stock attention path,
+and a follow-up samples it at the worst shape — a narrow q (675) against the whole retained KV, the
+least compute per byte of KV read. Attributing the 2.835 s further needs an instrument that does not
+exist yet: rows carry `prompt_target_prefill_time_s` (the whole prompt eval, `generation.py:7273`)
+and nothing finer, and the owned cache's `attention_time_s` cannot apply here because the owned
+subsystem is never wired (gates 1–2 above). Next instrument, if D1 is attacked before the curve
+itself: a per-phase timer inside prompt eval.
+

@@ -259,6 +259,33 @@ the 2.11.1 pins** (`uv sync`, or `pip install -e ".[dev,server]"` in a new envir
 reusing this one — otherwise every arm is measured on a runtime the tree does not support, and these
 parity failures will be read as regressions caused by the fix.
 
+**Superseded 2026-09-06 22:18 — that baseline no longer holds, and one flake surfaced on the way.**
+The seven failures above are fixed in-tree: the compiled-verify parity contract is now explicit
+instead of bit-exact-by-assumption (`baa6182`), and the stale source assertion in
+`test_a3b_compiled_target_prefix.py` was corrected in the same commit. A full `pytest tests/` on
+this venv then ran **6 620 tests across 371 files, exit 0, zero `FAILED`** — measured 2026-09-06
+20:44 at `98d5c52` and again 21:28 at `16ec337`. Task 0 Step 2's fresh-venv requirement still stands
+for *measurements* (this venv's MLX drift is what produced the parity errors); it is no longer what
+stands between you and a readable suite result.
+
+The 22:10 run then failed exactly one test. It is recorded here because it is a fixture defect that
+can hit any full run, not because it belongs to this plan's subject:
+
+- `tests/test_memory_pressure_guard.py::test_bank_shrink_to_bytes_evicts_lru_first` → `assert 1 == 2`.
+- Not a code regression: the test passes in isolation and so does its whole file; `total_nbytes` is
+  a plain `sum(entry.nbytes ...)` (`session_bank.py:633`) and `_evict_entry` pops one entry with an
+  identity fallback (`:2944-2950`), so nothing cascades that could stop the loop early.
+- Mechanism: the fixture built its keys as `token_ids=(hash(name) % 1000, 2, 3)`, and `str` hashing
+  is salted per process. When two of the three names collide mod 1000 the fabricated table holds
+  **2** entries instead of 3, `shrink_to_bytes(500)` correctly stops after one eviction, and the
+  assertion fails `1 == 2`. Reproduced on demand by giving two entries the same key (3 distinct keys
+  → `evicted 2`; colliding keys → `evicted 1`); 12 fresh processes showed the collision is rare
+  rather than systematic, which is why four earlier full runs were green.
+- Fix: deterministic literal keys in both tests that used the pattern — the sibling
+  `test_bank_shrink_protect_active_never_evicts_the_live_session` carried the same fixture and the
+  same latent flake. Assertions unchanged, nothing skipped or loosened; 14/14 fresh-process runs of
+  the file green afterwards.
+
 ## Tasks
 
 ### Task 0 — Re-baseline on this tree before touching anything
@@ -347,12 +374,36 @@ whether the lane is unreachable, or every further sweep stays unfalsifiable.
       `contiguous_then_repage` across two arms (`tests/test_prefill_attention_impl.py`, 9 cases),
       and the field distinguishes `"none"` (accounting ran, no lane fired) from `"unrecorded"`
       (never reached it) — the distinction the 16:36 sweep lacked when it read four counters as 0.
-- [ ] **Step 2:** new `tests/test_qwen4_prefill_lane.py`: with a fake `qwen4_exp` layer set, assert
-      the counter at `generation.py:1069` becomes non-zero past the ceiling. If no unit-level seam
-      exists, that absence is itself the finding — add the seam. **Still the blocker on the word
-      "unreachable"**: step 1 proved no counted lane fires under either layout, but only a seam can
-      tell "the code path never reaches the paged kernels" from "the kernels run and are not
-      counted".
+- [x] **Step 2 — DONE 2026-09-06, and the seam exists: the lane is unreachable by construction on
+      the served path.** `tests/test_qwen4_prefill_lane.py` (13 cases) pins four independent gates
+      in the order a request meets them:
+      1. `_target_prefill_cache_layout_scope` (`generation.py`) force-zeroes
+         `MTPLX_VLLM_METAL_PAGED_ATTN` / `MTPLX_OWNED_ATTN_KV` / `MTPLX_BLOCK_OWNED_ATTN_KV` while
+         *either* sustained layout is active — and `auto` always resolves to one of the two — so
+         `_make_target_prefill_cache` can never install the owned subsystem.
+      2. `install_vllm_metal_paged_attention_kv_cache` converts only entries exposing stock
+         `keys`/`values`. This family's 12 full-attention layers carry `QSACache` (KV inside `.kv`,
+         beside positional indexer streams), so they are skipped with every env on and the inner KV
+         already written: measured `entries: 0, skipped: 1`.
+      3. The GQA route block inside `paged_attention` runs only under
+         `MTPLX_VLLM_METAL_PAGED_ATTN_IMPL` in {`sdpa_2pass_paged`, `mlx_vector_paged`} with offset
+         past the 1024 two-pass threshold; the serve default sets neither.
+      4. The route is off by default and its q window is decode/MTP width (`min_q` 4, `max_q` 5):
+         an 8192-token prefill chunk is refused `q_len_gt_max` even with the route on, so no
+         ceiling sweep can ever move this counter.
+
+      The positive half is what turns the zero into a measurement rather than an absence: with the
+      object wired, paged impl, decode-width q and the pack's real head shape (24 query / 2 KV /
+      head_dim 256), `gqa_sdpa_calls = 1` with `by_route {async_per_head: 1}` and
+      `by_phase {prefill: 1}`; a prefill-width chunk with `PARTITIONED_ATTN` on gives
+      `partitioned_paged_calls_by_phase {prefill: 1}`. And with a non-paged impl the same call is
+      served with **no** counter and **no** recorded miss — the one place "runs uncounted" is real,
+      and it is inside the owned object, not on the serve path.
+
+      Verdict for criterion 5 of the prefill issue: not satisfiable by tuning on 2.11.x. Either the
+      client-side branch the criterion already names (sessions under ~60 k), or wiring `QSACache`
+      into the paged install — its own slice, since the indexer's raw/pooled streams are positional
+      buffers keyed to `kv.offset` and must survive the conversion.
 - [x] **Step 3:** sweep the lane from the *serve* harness, not the in-process one. **Partly done
       2026-09-06, and re-scoped:** `~/.mtplx/scripts/prefill-lane-sweep.py` ran three arms
       (auto / ceiling 32768 / forced repage) × three interleaved rounds at **51,395** tokens on a

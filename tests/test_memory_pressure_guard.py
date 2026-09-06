@@ -326,9 +326,9 @@ def test_bank_shrink_to_bytes_evicts_lru_first():
     # shrink must drop the oldest-accessed first.
     from mtplx.session_bank import SessionBankEntry, CacheSnapshot
 
-    def entry(name, last_access, nbytes):
+    def entry(name, last_access, nbytes, key):
         return SessionBankEntry(
-            token_ids=(hash(name) % 1000, 2, 3),
+            token_ids=(key, 2, 3),
             token_hash=name,
             model_path="/m",
             mtp_enabled=False,
@@ -346,10 +346,16 @@ def test_bank_shrink_to_bytes_evicts_lru_first():
     # (This test originally used string keys, which made _evict_entry's
     # pop-by-token_ids miss forever — shrink_to_bytes spun allocating
     # eviction-log records until the machine ran out of RAM.)
+    # The keys must also be *deterministic*: they were `hash(name) % 1000`,
+    # and str hashing is salted per process, so two of the three names could
+    # collide mod 1000 — the fabricated table then held 2 entries instead of
+    # 3 and shrink correctly stopped after one eviction, failing `== 2` with
+    # `1 == 2`. Observed once in a full-suite run (2026-09-06 22:10) and
+    # reproduced on demand by giving two entries the same key.
     fabricated = [
-        entry("old", last_access=1.0, nbytes=400),
-        entry("mid", last_access=2.0, nbytes=400),
-        entry("new", last_access=3.0, nbytes=400),
+        entry("old", last_access=1.0, nbytes=400, key=1),
+        entry("mid", last_access=2.0, nbytes=400, key=2),
+        entry("new", last_access=3.0, nbytes=400, key=3),
     ]
     bank._entries = {e.token_ids: e for e in fabricated}
     evicted = bank.shrink_to_bytes(500)
@@ -368,9 +374,9 @@ def test_bank_shrink_protect_active_never_evicts_the_live_session():
 
     bank = SessionBank(max_entries=8, max_bytes=1 << 30, per_session_max_bytes=1 << 30)
 
-    def entry(name, session, last_access, nbytes):
+    def entry(name, session, last_access, nbytes, key):
         return SessionBankEntry(
-            token_ids=(hash(name) % 1000, 2, 3),
+            token_ids=(key, 2, 3),
             token_hash=name,
             model_path="/m",
             mtp_enabled=False,
@@ -384,10 +390,14 @@ def test_bank_shrink_protect_active_never_evicts_the_live_session():
             last_access_s=last_access,
         )
 
+    # Deterministic keys for the reason recorded in
+    # test_bank_shrink_to_bytes_evicts_lru_first: salted str hashing could
+    # collide mod 1000 and silently drop one of the three fabricated entries,
+    # which every assertion below counts on.
     fabricated = [
-        entry("live-a", "ses_live", last_access=1.0, nbytes=400),
-        entry("live-b", "ses_live", last_access=2.0, nbytes=400),
-        entry("idle-a", "ses_idle", last_access=3.0, nbytes=400),
+        entry("live-a", "ses_live", last_access=1.0, nbytes=400, key=1),
+        entry("live-b", "ses_live", last_access=2.0, nbytes=400, key=2),
+        entry("idle-a", "ses_idle", last_access=3.0, nbytes=400, key=3),
     ]
     bank._entries = {e.token_ids: e for e in fabricated}
     bank._session_last_active = {"ses_live": _time.monotonic()}
