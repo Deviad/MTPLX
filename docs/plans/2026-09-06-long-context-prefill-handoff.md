@@ -677,3 +677,55 @@ buffers keyed to `kv.offset`, so a conversion has to keep the two views consiste
 snapshots of these caches, so any layout change has to survive a restore or warm prefixes will
 silently diverge (the `Desktop QA, pre-v2` failure the restore code comments describe).
 
+### Task 8 — an identical repeat request must not 500 (found while measuring, pre-existing)
+
+Found 2026-09-06 23:30 while repeating a follow-up to collect a median of three: re-sending a
+conversation whose whole prompt is already cached returns HTTP 500 with
+`ValueError: qwen4 fixed-M4 prompt history does not match the prefetched cache`
+(`qwen4_fixed_verify.py:269`, reached from `graphbank.py:2015 install_fixed_m4`). The check comes
+from `d6018d2` (ported from PR #391), so it is not a regression from this work stream, and no test
+covers it -- `grep 'prompt history does not match' tests/` is empty. A repeat is a retry-shaped
+request, so a client can meet it in normal use.
+
+Mechanism, read rather than guessed: the default aux route is `staged_sidecar`
+(`MTPLX_COMPILED_VERIFY_BOUNDARY` defaults to `both`, `graphbank.py:1354-1358`), and its builder
+compares the *device* history -- `previous = cache[ple_stage][ple.NGRAM_IDX]`, a `(1, 2)` int64
+window (`qwen4_fixed_verify.py:209-216`) -- against the last two prompt tokens, because the host
+ledger it stages must start from the same pair the cache holds. A finished generation leaves that
+window advanced by the token it produced, and with a fully cached prompt no suffix forward runs to
+re-align it. **The check itself is right**: staging a ledger from the prompt tail while the device
+holds a different pair would be silently wrong. What is wrong is the consequence -- a 500.
+
+The other route already solves it: `materialized` (`_prepare_fixed_m4_materialized` →
+`_prepare_compiled_verify_aux`) reads `previous` from the cache slot itself, so it is consistent by
+construction. And the choice is observable, not silent: `aux_route`/`aux_inputs` go into
+`_fixed_m4_dispatch` and surface in the stats snapshot (`graphbank.py:2053`, `:3014-3019`).
+
+- [x] **Step 1 — failing test first, and it failed for the right reason.**
+      `test_fixed_m4_falls_back_to_materialized_when_device_history_is_ahead` in
+      `tests/test_qwen4_exp_capture_commit.py`, on the existing two-route harness (`tm`, `_ids`,
+      `_host_ids`, `_FakeSidecar`, `install_qwen4_fixed_verify_route`,
+      `MTPLX_COMPILED_VERIFY_BOUNDARY=both`): it overwrites the PLE slot's n-gram window with a pair
+      that is not the prompt tail, then asserts `install_fixed_m4` does not raise and reports
+      `aux_route == "materialized"` / `aux_inputs == "device_history"`, while an untouched cache
+      still reports `staged_sidecar` so the common path cannot regress quietly. Red first with the
+      production traceback (`qwen4_fixed_verify.py:269: ValueError: qwen4 fixed-M4 prompt history
+      does not match the prefetched cache`). It also pins the new counter at 1 for the fallback and
+      0 for the aligned install.
+- [x] **Step 2 — implemented.** The builder returns `None` for *this* mismatch instead of raising,
+      and every geometry or sidecar raise stays loud: a wrong shape or a missing sidecar is a defect,
+      not a route choice. `install_fixed_m4` reads `None` as "the staged route cannot start from this
+      device history", takes the materialized branch, and counts it in
+      `stats["fixed_m4_staged_history_fallbacks"]` so a fleet-wide move off the faster route is
+      visible instead of inferred.
+- [x] **Step 3 — live proof on the side-by-side 9003, 2026-09-07 01:34.** Request 1 cold: 200 in 8.43 s with
+      `compiled_verify.fixed_m4.aux_route = staged_sidecar`, `aux_inputs = host_ledger`. Request 2,
+      byte-identical: **200** in 0.10 s with `cached = 7863`, `new = 0`,
+      `session_restore_mode = near_prefix_clone`, `aux_route = materialized`,
+      `aux_inputs = device_history`. The route change is itself the evidence the mismatch was real --
+      an aligned cache stays staged -- and request 1 shows the common path untouched. Before the
+      change the same second request returned HTTP 500. 9001/9002 healthy throughout; 9003 stopped
+      afterwards.
+- [x] **Step 4 — full suite green at the commit carrying this** (`pytest tests/` exit 0, zero
+      `FAILED`), and the receipt records before (500 + traceback) and after.
+

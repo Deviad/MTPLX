@@ -886,3 +886,72 @@ def test_fixed_m4_bank_fails_loud_instead_of_falling_back(tm, monkeypatch):
 
     with pytest.raises(RuntimeError, match="fixed-M4 verifier refused: forced"):
         bank.forward_ar_capture(_ids(WINDOW, seed=22), cache=tm.make_cache())
+
+
+def test_fixed_m4_falls_back_to_materialized_when_device_history_is_ahead(
+    tm, monkeypatch
+):
+    """An identical repeat request must not 500.
+
+    A finished generation leaves the PLE n-gram window advanced by the token it
+    produced. When the next request repeats the prompt exactly, the whole prompt
+    is cached, so no suffix forward runs to re-align that window -- and the staged
+    sidecar route used to refuse the install with "qwen4 fixed-M4 prompt history
+    does not match the prefetched cache", which reached the client as HTTP 500
+    (measured on the live server; the check predates this work, from d6018d2).
+
+    The comparison stays: staging a host ledger from the prompt tail while the
+    device holds a different pair would be silently wrong. What changes is the
+    consequence -- the install takes the materialized route, which reads
+    `previous` from the cache itself and is therefore consistent by construction.
+    """
+    import mtplx.graphbank as graphbank
+    from mtplx.qwen4_fixed_verify import install_qwen4_fixed_verify_route
+
+    class TinyRuntime:
+        pass
+
+    prefill = _ids(PREFILL, seed=41)
+    prompt_ids = _host_ids(prefill)
+
+    def build(cache):
+        runtime = TinyRuntime()
+        runtime.model = SimpleNamespace(language_model=tm)
+        install_qwen4_fixed_verify_route(runtime)
+        bank = graphbank.CompiledVerifyBank(
+            runtime, max_verify_len=WINDOW, request_max_tokens=16
+        )
+        bank.install_fixed_m4(cache, prompt_ids=prompt_ids, hidden_variant=None)
+        return bank
+
+    ple_index = next(
+        i for i, layer in enumerate(tm.model.layers) if getattr(layer, "ple", None)
+    )
+    ple = tm.model.layers[ple_index].ple
+
+    # The aligned cache still takes the fast route: no regression on the common path.
+    ple.ple_embedding.ngram_embedding._sidecar = _FakeSidecar()
+    monkeypatch.setattr(graphbank, "_PREWARM_DONE", True)
+    monkeypatch.setattr(graphbank, "_compiled_verify_bits_gate_ok", lambda _rt: True)
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_BOUNDARY", "both")
+    aligned = tm.make_cache()
+    tm(prefill, cache=aligned)
+    aligned_bank = build(aligned)
+    assert aligned_bank._fixed_m4_dispatch["aux_route"] == "staged_sidecar"
+    assert aligned_bank.stats["fixed_m4_staged_history_fallbacks"] == 0
+
+    # The window a finished generation leaves behind: the last prompt token plus
+    # the token it produced, i.e. not the prompt's last two. Shape and dtype stay
+    # valid so the geometry check passes and the history check is what fires.
+    ahead = tm.make_cache()
+    tm(prefill, cache=ahead)
+    ahead[ple_index][ple.NGRAM_IDX] = mx.array(
+        [[int(prompt_ids[-1]), 424242]], dtype=mx.int64
+    )
+    fell_back = build(ahead)
+    assert fell_back._fixed_m4_dispatch["aux_route"] == "materialized"
+    assert fell_back._fixed_m4_dispatch["aux_inputs"] == "device_history"
+    # The fallback is counted, so a fleet-wide move off the faster staged route
+    # shows up in the stats snapshot instead of being inferred from timings.
+    assert fell_back.stats["fixed_m4_staged_history_fallbacks"] == 1
+

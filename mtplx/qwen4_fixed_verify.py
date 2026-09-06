@@ -199,7 +199,12 @@ def _fixed_m4_previous_tokens(
 
 
 def _build_fixed_m4_compiled_verify_aux(self: Any, cache, prompt_ids):
-    """Validate and bind the production sidecar gather once after prefill."""
+    """Validate and bind the production sidecar gather once after prefill.
+
+    Returns ``None`` when the staged host ledger cannot start from the history
+    the device cache holds; every other problem still raises, because a wrong
+    geometry or a missing sidecar is a defect rather than a route choice.
+    """
 
     inner = _inner(self)
     layer_index = int(inner._ple_stage_idx)
@@ -266,9 +271,15 @@ def _build_fixed_m4_compiled_verify_aux(self: Any, cache, prompt_ids):
         for token in np.asarray(previous, dtype=np.int64).reshape(-1)
     )
     if device_history != prompt_tail:
-        raise ValueError(
-            "qwen4 fixed-M4 prompt history does not match the prefetched cache"
-        )
+        # Not an error, though it used to raise one: a request that repeats a
+        # prompt exactly finds the whole prompt already cached, so no suffix
+        # forward runs to re-align this window, and a finished generation leaves
+        # it advanced by the token it produced. Staging a host ledger from the
+        # prompt tail while the device holds a different pair WOULD be wrong, so
+        # decline the staged route and let the caller take the materialized one,
+        # which reads `previous` from the cache itself. Until 2026-09-07 this
+        # raised, which reached clients as HTTP 500 on a retry-shaped request.
+        return None
     rows = partial(
         _ngram_rows_np,
         mult=mult,

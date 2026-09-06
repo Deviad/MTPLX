@@ -593,3 +593,41 @@ carries a credential or a non-loopback URL, and none hardcodes an absolute path:
 `$MTPLX_HOME` (default `$HOME/.mtplx`) and ports, wrappers and model directories are arguments.
 Checked before publishing, not assumed: `scripts/hygiene_scan.sh` exit 0 with all five present.
 
+## An identical repeat request used to 500; now it falls back and answers (2026-09-07 01:34)
+
+Found by measurement, not by report: collecting a median of three follow-ups by re-sending the same
+request produced
+
+```
+HTTP 500
+ValueError: qwen4 fixed-M4 prompt history does not match the prefetched cache
+  mtplx/graphbank.py:2015, in install_fixed_m4
+  mtplx/qwen4_fixed_verify.py:269, in _build_fixed_m4_compiled_verify_aux
+```
+
+The check is from `d6018d2` (ported from PR #391), so it predates this work stream, and no test
+covered it. The mechanism: the default aux route is `staged_sidecar`, whose builder compares the
+device n-gram window (`cache[ple_stage][ple.NGRAM_IDX]`, a `(1, 2)` int64 pair) with the prompt's
+last two tokens, because the host ledger it stages has to start from the pair the cache actually
+holds. A finished generation leaves that window advanced by the token it produced, and when the next
+request repeats the prompt exactly the whole prompt is already cached, so no suffix forward runs to
+re-align it. The comparison is right -- staging from a different pair would be silently wrong -- and
+the consequence was wrong: a 500 on a retry-shaped request.
+
+Fix: the builder returns `None` for this mismatch only, every geometry and sidecar raise stays loud,
+and `install_fixed_m4` reads `None` as "the staged route cannot start here" and takes the
+`materialized` route, which reads the window from the cache itself. The fallback is counted
+(`stats["fixed_m4_staged_history_fallbacks"]`) and visible per request
+(`compiled_verify.fixed_m4.aux_route`), so a move off the faster route cannot hide.
+
+| | request 1 (cold) | request 2 (byte-identical repeat) |
+|---|---|---|
+| before | 200 | **HTTP 500**, the `ValueError` above |
+| after | 200 in 8.43 s, `aux_route staged_sidecar`, `aux_inputs host_ledger` | **200 in 0.10 s**, `cached 7863`, `new 0`, `restore near_prefix_clone`, `aux_route materialized`, `aux_inputs device_history` |
+
+Side-by-side 9003 on the repo build, 9001/9002 untouched and healthy throughout. The route change on
+request 2 is itself the evidence that the mismatch was real: an aligned cache stays on
+`staged_sidecar`, which request 1 shows. Test:
+`tests/test_qwen4_exp_capture_commit.py::test_fixed_m4_falls_back_to_materialized_when_device_history_is_ahead`,
+red first with the production traceback, pinning both routes and the counter. Full suite exit 0.
+

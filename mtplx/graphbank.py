@@ -1925,6 +1925,10 @@ class CompiledVerifyBank:
             "extended_calls": 0,
             "fallback_calls": 0,
             "fallback_reasons": {},
+            # The staged sidecar route declined because the device n-gram window
+            # was not at the prompt tail (a fully cached repeat). Counted so a
+            # fleet-wide move onto the slower route is visible, not inferred.
+            "fixed_m4_staged_history_fallbacks": 0,
             "buckets": {},
             "promoted": 0,
             "demotions": 0,
@@ -2011,8 +2015,17 @@ class CompiledVerifyBank:
             capture_pos += len(names)
 
         boundary = _compiled_verify_boundary()
+        prepare_aux = None
         if self._build_fixed_m4_aux is not None and boundary in ("both", "pre"):
+            # None means the staged host ledger cannot start from the history the
+            # device cache holds. Fall back rather than fail the request: the
+            # materialized route reads that history from the cache itself.
             prepare_aux = self._build_fixed_m4_aux(cache, prompt_ids)
+            if prepare_aux is None:
+                self.stats["fixed_m4_staged_history_fallbacks"] = int(
+                    self.stats.get("fixed_m4_staged_history_fallbacks", 0)
+                ) + 1
+        if prepare_aux is not None:
             aux_route = "staged_sidecar"
             aux_inputs = "host_ledger"
         else:
