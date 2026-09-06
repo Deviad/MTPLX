@@ -876,6 +876,305 @@ def _apply_family_verify_lane_override(model: str) -> str | None:
     return os.environ[QWEN4_FIXED_M4_VERIFY_ENV]
 
 
+# --- serve harness: measure a live server instead of loading the pack here -------
+#
+# The in-process ladder cannot run some families at all: enabling a pack's own
+# verify lane needs the server's cache containers, so `runtime.load()` reaches
+# `unsupported_container:ArraysCache` (graphbank.py) on qwen4_exp. Hand-mirroring
+# the server's env in the bench reaches a second wall, so the ladder can instead
+# drive a real server and measure what the product actually does.
+
+SERVER_HARNESS = "direct-http"
+BENCH_DEFAULT_URL = "http://127.0.0.1:8000"
+BENCH_DEFAULT_PORT = 8041
+SERVER_TIMEOUT_S = 1800.0
+MIN_SERVER_DECODE_TOKENS = 8
+
+
+def _ladder_server_url(args: Any) -> str | None:
+    """Base URL of the server under test, or ``None`` when the harness is in-process.
+
+    Selected by ``--harness direct-http``, the bench vocabulary for driving a server
+    over HTTP. An explicit ``--port`` wins because a second MTPLX instance on its own
+    port is the common case; otherwise ``--url`` is used as given, and that flag
+    already defaults to MTPLX's own default port 8000.
+    """
+
+    if str(getattr(args, "harness", "auto") or "auto").strip().lower() != SERVER_HARNESS:
+        return None
+    port = getattr(args, "port", None)
+    if port is not None and int(port) != BENCH_DEFAULT_PORT:
+        return f"http://127.0.0.1:{int(port)}"
+    url = str(getattr(args, "url", "") or "").strip()
+    return (url or BENCH_DEFAULT_URL).rstrip("/")
+
+
+def _ladder_tokenizer(model: str) -> Any:
+    """Tokenizer only — the serve harness must never allocate the pack's weights.
+
+    Reuses the runtime's resilient tokenizer loader (it carries the `tokenizer.json`
+    fallback for packs whose `tokenizer_config.json` a strict `AutoTokenizer` rejects)
+    instead of re-implementing that recovery here.
+    """
+
+    path = Path(str(model)).expanduser()
+    config_path = path / "config.json"
+    if config_path.exists():
+        from .runtime import _load_tokenizer_resilient
+
+        return _load_tokenizer_resilient(
+            path, json.loads(config_path.read_text(encoding="utf-8"))
+        )
+    from mlx_lm.utils import load_tokenizer
+
+    return load_tokenizer(str(model))
+
+
+def _ladder_v1(base_url: str) -> str:
+    """OpenAI-compatibility root of a server URL given without it.
+
+    ``bench --url`` defaults to ``http://127.0.0.1:8000`` with no ``/v1``, while the
+    endpoints live under ``/v1``; appending here keeps both spellings working and the
+    404 that a missing segment produces out of the receipts.
+    """
+
+    trimmed = base_url.rstrip("/")
+    return trimmed if trimmed.endswith("/v1") else f"{trimmed}/v1"
+
+
+def _ladder_unreachable(base_url: str, exc: Exception) -> RuntimeError:
+    """Split "no server" from "the server answered and refused".
+
+    `HTTPError` subclasses `URLError`, so catching them together reported a 400
+    refusal as an unreachable host — measured while first running the harness at
+    the pack's full context, where the server said why and this said nothing.
+    """
+
+    import urllib.error
+
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+        except Exception:  # noqa: BLE001 - a broken body must not mask the status
+            detail = ""
+        return RuntimeError(
+            f"prefill ladder was refused by the server at {base_url}: HTTP {exc.code}"
+            f"{': ' + detail if detail else ''}"
+        )
+    return RuntimeError(
+        f"prefill ladder cannot reach the server at {base_url}: "
+        f"{type(exc).__name__}: {exc}. Start it (mtplx serve --port ...) or pass the "
+        "right --url/--port."
+    )
+
+
+def _ladder_served_target(base_url: str, *, timeout_s: float) -> dict[str, Any]:
+    """Served id and advertised window, so a receipt names what it measured.
+
+    The window is what the in-process path checks before loading (#261 / F7:
+    "refuse contexts beyond the model's context window instead of silently
+    benchmarking past the trained window"); in serve mode the same discipline has
+    to ask the server, because the server is the thing that will refuse."""
+
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"{_ladder_v1(base_url)}/models", timeout=timeout_s
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return {}
+    models = data.get("data") or []
+    if not models or not isinstance(models[0], dict):
+        return {}
+    model = models[0]
+    target: dict[str, Any] = {}
+    if model.get("id"):
+        target["model_id"] = str(model["id"])
+    for key in ("context_length", "max_context_length", "model_max_length"):
+        if isinstance(model.get(key), int) and model[key] > 0:
+            target["context_length"] = int(model[key])
+            break
+    return target
+
+
+def _ladder_server_row(
+    base_url: str,
+    *,
+    context_tokens: int,
+    text: str,
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """One streamed chat completion, reported with the ladder's row vocabulary.
+
+    MTPLX puts the final ``usage`` on the stream without ``stream_options``, which is
+    what makes a single request enough: first-delta time gives TTFT, and
+    ``usage.prompt_tokens_details.cached_tokens`` separates re-prefill from reuse.
+    """
+
+    import time
+    import urllib.request
+
+    request_body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "seed": int(seed),
+        "stream": True,
+    }
+    request = urllib.request.Request(
+        f"{_ladder_v1(base_url)}/chat/completions",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started_s = time.perf_counter()
+    first_token_s: float | None = None
+    usage: dict[str, Any] = {}
+    import urllib.error
+
+    try:
+        opened = urllib.request.urlopen(request, timeout=timeout_s)
+    except urllib.error.HTTPError as exc:
+        raise _ladder_unreachable(base_url, exc) from exc
+    except urllib.error.URLError as exc:
+        raise _ladder_unreachable(base_url, exc) from exc
+    with opened as response:
+        for raw in response:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                chunk = json.loads(body)
+            except ValueError:
+                continue
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                emitted = delta.get("content") or delta.get("reasoning_content")
+                if emitted and first_token_s is None:
+                    first_token_s = time.perf_counter()
+    total_s = time.perf_counter() - started_s
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = int(details.get("cached_tokens") or 0)
+    generated = int(usage.get("completion_tokens") or 0)
+    new_prefill = max(0, prompt_tokens - cached_tokens)
+    ttft_s = (first_token_s - started_s) if first_token_s is not None else None
+    prompt_tps = (
+        new_prefill / ttft_s if ttft_s and ttft_s > 0 and new_prefill > 0 else 0.0
+    )
+    decode_elapsed_s = max(0.0, total_s - (ttft_s or 0.0))
+    return {
+        "context_tokens": int(context_tokens),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "new_prefill_tokens": new_prefill,
+        "context_delta_tokens": prompt_tokens - int(context_tokens),
+        "prompt_tps": prompt_tps,
+        "pp_tps": prompt_tps,
+        # Includes the first token's sampling: the ladder's own `ttft_s` is the same
+        # kind of bound, so the two stay comparable instead of quietly different.
+        "ttft_s": ttft_s,
+        "wall_s": total_s,
+        # Decode needs enough samples to mean anything: with max_tokens=4 a
+        # 4-token tail divided by the residual window reads 1410 tok/s on a
+        # 512-token context (measured), so short rows report no rate at all.
+        "decode_tok_s": (
+            (max(0, generated - 1) / decode_elapsed_s)
+            if decode_elapsed_s > 0 and generated >= MIN_SERVER_DECODE_TOKENS
+            else None
+        ),
+        "generated_tokens": generated,
+        "measure": "serve",
+    }
+
+
+def _run_prefill_ladder_against_server(
+    args: Any,
+    *,
+    payload: dict[str, Any],
+    base_url: str,
+    contexts: list[int],
+    prompt_style: str,
+    prompt_format: str,
+    prompt_tail: str,
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    """The ladder's prompt policy, delivered to a server instead of a local runtime."""
+
+    model = str(payload.get("model") or getattr(args, "model", "") or "")
+    target = _ladder_served_target(base_url, timeout_s=10.0)
+    served_id = str(target.get("model_id") or model)
+    window = int(target.get("context_length") or 0)
+    max_tokens = int(getattr(args, "max_tokens", 128) or 128)
+    over = [int(c) for c in contexts if window and int(c) + max_tokens > window]
+    if over:
+        raise RuntimeError(
+            f"prefill ladder contexts {over} do not fit the server at {base_url}, which "
+            f"advertises {window} tokens (asked {max_tokens} more to generate). Drop them "
+            "with --contexts or raise the server's --context-window."
+        )
+    payload["harness"] = SERVER_HARNESS
+    payload["in_process_model_load"] = False
+    payload["server"] = {"url": base_url, **target}
+    tokenizer = _ladder_tokenizer(model)
+    payload.setdefault("rows", [])
+    seed_base = int(getattr(args, "seed", None) or 0)
+    vary_seed_by_context = bool(getattr(args, "vary_seed_by_context", False))
+    for index, context_tokens in enumerate(contexts):
+        build = _prompt_build_for_context(
+            tokenizer,
+            int(context_tokens),
+            prompt_style=prompt_style,
+            prompt_tail=prompt_tail,
+            prompt_format=prompt_format,
+            enable_thinking=enable_thinking,
+        )
+        row = _ladder_server_row(
+            base_url,
+            context_tokens=int(context_tokens),
+            text=tokenizer.decode(build.token_ids),
+            model_id=served_id,
+            max_tokens=max_tokens,
+            temperature=float(getattr(args, "temperature", 0.6) or 0.6),
+            top_p=float(getattr(args, "top_p", 0.95) or 0.95),
+            top_k=int(getattr(args, "top_k", 20) or 20),
+            seed=(seed_base + index if vary_seed_by_context else seed_base),
+            timeout_s=SERVER_TIMEOUT_S,
+        )
+        row.update(build.metadata)
+        row["requested_prefill_layout"] = payload.get("prefill_layout", {}).get("requested")
+        payload["rows"].append(row)
+    # The layout sweep this key would carry is an in-process knob; in serve mode the
+    # server under test owns it, so the key stays present and empty rather than absent
+    # (JSON consumers read it unconditionally).
+    payload["recommended_plugged_in_commands"] = []
+    payload["serve_harness_note"] = (
+        "profile env, layout and allocator settings belong to the server under test; "
+        "read them from its /mtplx/settings, not from this payload. Cold-prefill rows "
+        "require a fresh server too: the session bank survives a request, so a repeated "
+        "context reports cached_tokens ~= prompt_tokens and a prefill rate of 0 (measured: "
+        "32777/32777 cached, ttft 0.30s on a second run)"
+    )
+    return payload
+
+
 def run_prefill_ladder(args: Any) -> dict[str, Any]:
     contexts = parse_contexts(getattr(args, "contexts", None), full=bool(getattr(args, "full", False)))
     profile = _ladder_profile(args)
@@ -1068,6 +1367,23 @@ def run_prefill_ladder(args: Any) -> dict[str, Any]:
             )
     if payload["dry_run"]:
         return payload
+
+    server_url = _ladder_server_url(args)
+    if server_url is not None:
+        # Everything below this point configures *this* process to host a model. In
+        # serve mode the server under test owns that configuration, so the profile
+        # env, the family lane, the allocator caps and the MX cache cleanup must not
+        # be applied — or reproduced — here.
+        return _run_prefill_ladder_against_server(
+            args,
+            payload=payload,
+            base_url=server_url,
+            contexts=contexts,
+            prompt_style=prompt_style,
+            prompt_format=prompt_format,
+            prompt_tail=prompt_tail,
+            enable_thinking=enable_thinking,
+        )
 
     apply_profile_env(profile.name)
     family_verify_lane = _apply_family_verify_lane_override(model)
