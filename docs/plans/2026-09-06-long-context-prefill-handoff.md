@@ -729,3 +729,50 @@ construction. And the choice is observable, not silent: `aux_route`/`aux_inputs`
 - [x] **Step 4 — full suite green at the commit carrying this** (`pytest tests/` exit 0, zero
       `FAILED`), and the receipt records before (500 + traceback) and after.
 
+### QSA confirmation and boundary storage follow-up (2026-09-07)
+
+Issue-1's "Conferma QSA e costo boundary" is the plan of record for this measurement slice.
+Artifacts: `$MTPLX_HOME/bench/qsa-confirmation-20260907/`. Full results and corrected historical
+attributions are in the receipt's "Corrected confirmation and boundary storage price" section.
+
+- [x] Three real 104k baseline/compiled rounds, identical input hashes and explicit engagement:
+      `confirmation-v2.jsonl`, exit 0. Compiled requires fused AND compiled flags; the earlier
+      compiled-only screen did not establish engagement. Median follow-up: baseline 1.652785 s,
+      candidate 1.882180 s. Compiled calls occur in cold/divergent legs, not the brief follow-up.
+      **Criterion 3 remains open; do not enable this candidate for it.**
+- [x] Short and long greedy comparisons agree across the three rounds of each arm. Evidence:
+      `confirmation-v2.log` and stored response fingerprints. This is sampled output agreement,
+      not universal state/logit parity.
+- [x] Boundary storage measured on equivalent persisted cold entries: `boundary-single-cold.jsonl`,
+      one entry per bank, matching prefix/token hash, 7 versus 28 retained boundaries. Raising cap
+      8 to 32 adds 2.262108 GiB of logical snapshot tensors and 2.346069 GiB of allocated bank disk.
+      Non-boundary tensor metadata/blob references match. RAM bank entry counts differed, so do
+      not interpret aggregate RAM counters as marginal per-snapshot memory.
+- [ ] Boundary output equivalence remains unproven: `boundary-memory.jsonl` has differing long
+      greedy fingerprints at cap8/cap32. Cold-only storage equivalence does not close this finding.
+      No production boundary-cap change or push is authorized by these measurements.
+
+### Actual suffix-width follow-up (2026-09-07)
+
+Issue-1 slice "Follow-up: compilazione della larghezza effettiva" tested the existing
+`MTPLX_QSA_PREFILL_COMPILE_ROWS=256` setting with fused/compiled enabled, preserving boundary8
+and tail grid256. Artifact root: `$MTPLX_HOME/bench/qsa-followup-256-20260907/`.
+
+- [x] `indexer-tests.log`: 16 tests passed; actual 104k serving slice in `screen.jsonl`
+      confirms 26 compiled selector calls in the ordinary follow-up and matching fingerprints.
+- [x] Candidate assessed, not enabled: 1.441413 s against paired baseline1.385912 s supplies no
+      positive speed signal. No claim of a statistically established regression from one pair.
+- [x] Baseline repeated without another configuration change: `baseline-repeats.jsonl` plus the
+      baseline in `screen.jsonl` give three samples with median1.385911626 s, identical work and
+      outputs. Numeric threshold met in this ~101k subcase, not a new software improvement.
+- [ ] Original criterion3 remains broader: original103k/556-token work and disappearance of
+      context scaling have not been demonstrated by the current sample. Do not mark it fully met
+      or attribute cross-session baseline variation to an unverified cause.
+
+### Consolidation decision (2026-09-07)
+
+The user elected to stop further tuning at diminishing returns and commit the measured result.
+Keep the already-enabled sparse QSA lane; do not enable the experimental compiled-indexer or
+boundary32 arms. The remaining acceptance gaps above are deferred, not marked satisfied. No
+additional server restart, production configuration change, or push is part of this consolidation.
+

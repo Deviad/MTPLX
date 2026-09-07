@@ -644,35 +644,23 @@ screen, not a claim: criterion 3 wants a median of >= 3 and this table cannot su
 | fused_indexer | `MTPLX_FUSED_QSA_INDEXER=1` | 118.01 | 859.3 | 2.059 | 3.064 | match |
 | **compiled_indexer** | `MTPLX_COMPILED_QSA_INDEXER=1` | 118.64 | 854.5 | **1.598** | **2.378** | match |
 
-Read what the table can and cannot say:
+**Superseded attribution, corrected 2026-09-07:** these are historical timings, not evidence of
+compiled-selector engagement. `_compiled_route_supported` in `mtplx/models/qwen4_exp.py` requires
+BOTH `MTPLX_FUSED_QSA_INDEXER` and `MTPLX_COMPILED_QSA_INDEXER`; this screen set only the latter.
+It also used arm-dependent prompt bodies and did not isolate inherited competing flags. The earlier
+claim of a compiled-kernel speedup is withdrawn. A single run does not establish a noise bound.
 
-- **Cold prefill does not move** (117.0-118.6 s across all four arms, inside the ~5 % single-run
-  noise seen at 8 k), so none of these kernels is a lever for criterion 4 -- which is already met.
-- **The follow-up moves, and one arm moves it a lot**: `MTPLX_COMPILED_QSA_INDEXER=1` is -24.3 %
-  against its own same-session baseline (1.598 s vs 2.111 s), well outside that noise. `gather` is
-  -10.6 %, `fused_indexer` -2.5 %.
-- **These absolute numbers are worse than the ones earlier in this receipt** (baseline follow-up
-  2.111 s here vs 1.56 s at 23:45, cold 118.09 vs 104.68) because the machine is now carrying three
-  resident packs and full session banks -- 9002 at 83.4 GiB RSS, 9003 at 58.3 GiB, 9001 compressed
-  down to 2.3 GiB RSS, 26 % memory free, swap 171.62 MiB, and 91 GiB of bank blobs plus 48 GiB in
-  `flash-next-9002`. Comparisons inside this table are valid; comparisons against the earlier tables
-  are not. That sensitivity is itself worth remembering when reading any number in this file.
-- **Exactness held on the leg that was run**: a greedy 64-token completion of a fixed short prompt,
-  fingerprinted as content + reasoning content + finish reason, matched the baseline in all three
-  arms. That is a real check and a narrow one -- it exercises the indexer at short context, while the
-  candidate's risk is at long context. Before this is enabled on a serving port it needs the same
-  fingerprint on a 100 k-class prompt, and the median of >= 3 follow-ups per arm that criterion 3
-  asks for.
-
-So the screen says where to look next and nothing more: `MTPLX_COMPILED_QSA_INDEXER` is the one
-candidate worth a confirmation battery, and it is already reachable per port (it is registered in
-`MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, `profiles.py:323`), so enabling it needs no code change -- which
-is also why it must be measured properly before anyone flips it.
+The short greedy fingerprints matched, but that does not prove correctness at long context.
+RSS and swap readings were observations, not proof of compression, eviction, or the cause of timing
+variation. Different system load may affect results, but even an intra-session comparison needs
+identical work and engagement evidence. The corrected confirmation below supplies both.
 
 ## A diverging continuation is priced by the boundary budget, and the budget is a knob (2026-09-07 02:02)
 
-The 36.57 s diverging continuation reported earlier is not a defect and not an eviction: it is
-`MTPLX_GDN_BOUNDARY_MAX`, whose default is **8**.
+The earlier claim that this was definitively "not a defect and not an eviction" is withdrawn.
+`MTPLX_GDN_BOUNDARY_MAX` defaults to **8** and can affect restore coverage, but the historical
+selected boundary alone did not establish which capture, inheritance, thinning, or shedding step
+removed later snapshots. The controlled comparison below also found differing generated text.
 
 Mechanism, from the code. A hybrid model can only resume its recurrent state at a token whose state
 was actually captured, so a restore lands on the newest stored boundary at or below the match
@@ -693,31 +681,104 @@ side-by-side 9003 at the 104 k rung:
 | 8 (default), 23:30 | 96 256 | ~5 100 | 5 726 | 26.90 s | 24.905 s |
 | **32**, 02:02 | **101 120** | **~230** | **485** | **0.702 s** | 0.661 s |
 
-The causal fact is the restore point, which does not depend on machine load: the gap falls from
-7 097 tokens to ~230, and the re-prefill falls from 7 776 tokens to 485. The two runs were not taken
-under the same load (the later one had three packs resident and 26 % memory free), so the wall-clock
-ratio is not a clean A/B -- but a 7 776-token re-prefill against a 485-token one needs no clean A/B
-to be understood, and the per-token costs agree with the curve (4.45 ms/token at cap 8, 1.36 ms/token
-at cap 32, the latter back near the short-context rate because there is almost nothing left to
-re-prefill).
+These historical requests restored different token counts and were not a controlled A/B. They do
+not establish a wall-clock speedup, zero capture overhead, or the absence of memory-budget shedding.
+Nor does an extending turn bypassing boundary restore prove that storing extra snapshots is free.
+The old 11 GB bank-directory observation did not isolate one equivalent persisted entry. Use the
+single-cold measurement below for the storage price instead.
 
-What the knob costs, and what it does not:
+## Corrected confirmation and boundary storage price (2026-09-07)
 
-- **Cold prefill does not pay for it.** With the cap at 32 the 104 k cold row is 119.59 s / 847.5
-  tok/s, against 117.0-118.6 s for the four arms of the battery above in the same loaded session --
-  inside the noise, so capturing four times the boundaries is not a prefill tax.
-- **Memory is the price and it is not fully quantified here.** One 104 k entry with the cap at 32
-  occupies 11 GB in `$MTPLX_HOME/session-bank/flash-next-repo-9003`, and the rows report
-  `cache_memory_bytes` 7.97-7.99 GiB. The same measurement at the default cap was not taken in this
-  session, so the *marginal* cost of raising 8 -> 32 is unmeasured; the code's own note ("MB-scale per
-  boundary") implies a few GB across 24 extra snapshots, and that is an inference, not a number. The
-  measurement that would settle it is one `du` of the bank directory under each cap.
-- **It only prices diverging continuations.** A turn that extends the stored chain restores with
-  `near_prefix_clone` at the full match (101 305 of 101 305) and never touches the boundary grid, so
-  ordinary agent turns are unaffected by this knob either way.
+Plan of record: issue-1, "Conferma QSA e costo boundary". Operator artifacts are under
+`$MTPLX_HOME/bench/qsa-confirmation-20260907/`; `summary.json` records the derived values and caveats.
+No model code or production-port configuration changed in this measurement slice.
 
-So the earlier "trimmed snapshot" wording was wrong in an important way: nothing was trimmed by a byte
-budget, the restore simply could not go past the last captured boundary. Whether to raise the default
-is a product decision -- memory per session against the cost of an edited or branched conversation --
-and it now has numbers on both sides of it except the one just named.
+### Compiled indexer: no demonstrated follow-up improvement
+
+`confirmation-v2.jsonl` and `confirmation-v2.log`: three rounds per arm on 9003, alternating order,
+fresh isolated banks retained on disk. Both flags are enabled for the compiled candidate and disabled
+for baseline; other competing knobs are explicitly fixed. Every corresponding request has the same
+input SHA-256. The requested `104k` rung rendered **101296 cold tokens**; follow-ups restored
+**101289**, evaluating **673 new tokens** in every round.
+
+| arm | follow-up samples s | median cold s | median follow-up s | median divergent leg s |
+|---|---|---|---|---|
+| baseline | 1.778834, 1.652785, 1.631534 | 117.455277 | **1.652785** | 8.750930 |
+| fused + compiled | 1.923211, 1.882180, 1.695294 | 118.664450 | **1.882180** | 8.896423 |
+
+The engagement receipt `MTPLX_QSA_PREFILL_ENGAGEMENT_FILE` reports **429 compiled_selector calls
+in each candidate cold leg, 39 in each divergent leg, and zero in every brief follow-up**. Baseline
+has zero compiled calls. Therefore this kernel is not executing in the request phase criterion 3
+needs to accelerate. Both follow-up medians exceed 1.40 s; do not enable this candidate for that goal.
+The higher candidate follow-up median is an observation, not proof that compiled execution directly
+slows that phase.
+
+All cold/follow-up/short/long fingerprints matched across the six runs. The long leg restored 94208
+and evaluated 7110 new tokens, then generated 48 greedy tokens; the short leg generated 64. Fingerprints
+include reasoning content and finish reason, not just an empty answer. This is agreement on sampled
+generations, not universal state/logit parity. The first `confirmation.jsonl` was excluded after a
+warmup row exposed a harness correlation error; request rows are now matched by response/request id.
+
+### Boundary price: equivalent persisted cold entries
+
+`boundary-single-cold.jsonl` and its log: one identical cold request per cap, one persisted entry
+per bank after shutdown, prefix length **101297** and identical token hash. The benchmark alone uses
+`MTPLX_SHUTDOWN_SSD_FLUSH_S=60` so the larger snapshot can finish writing. The cap32 shutdown receipt
+reports its pending write flushed in 16.34 s. A drained writer queue before shutdown was insufficient:
+persistence can still be held by the scheduler.
+
+| configured cap | retained boundaries | logical snapshot bytes | whole-bank du bytes after shutdown |
+|---|---|---|---|
+| 8 | 7 | 4044093056 (3.766355 GiB) | 4081893376 (3.801559 GiB) |
+| 32 | 28 | 6473013200 (6.028463 GiB) | 6600966144 (6.147629 GiB) |
+
+Marginal price for this persisted snapshot: **2428920144 logical bytes (2.262108 GiB)** and
+**2519072768 allocated disk bytes (2.346069 GiB)** including the bank's metadata/allocation overhead.
+The payloads' non-boundary tensor metadata and content-addressed blob references match; the logical
+byte delta is entirely the boundary tensors. This is not a process-RSS measurement. Raw RAM bank
+counters had different entry counts (two versus one) and cannot be compared as a per-snapshot cost.
+Cold timings were 104.912 s and 105.046 s: single observations, not proof of zero overhead.
+
+**Do not enable cap32 yet as an exactness-preserving optimization.** In the preceding full-sequence
+`boundary-memory.jsonl`, the same divergent input restored 94208/new 7110 at cap8 versus
+101120/new 198 at cap32; prompt time was 11.652 s versus 0.454 s, but the 48-token greedy reasoning
+fingerprints differed. The cause (numerical sensitivity or a restore defect) is not established.
+That run's cap32 bank also had no manifest entry after the old 10 s shutdown budget, so its partial
+blob directory is excluded from the disk comparison. The later cold-only slice settles storage cost,
+not this output-equivalence question.
+
+## Compile the actual suffix width: executed, but no positive speed signal (2026-09-07)
+
+Issue-1 slice: "Follow-up: compilazione della larghezza effettiva". Artifacts are under
+`$MTPLX_HOME/bench/qsa-followup-256-20260907/` (`screen.jsonl`, `baseline-repeats.jsonl`,
+`indexer-tests.log`, `summary.json`). No model code or production-port settings changed.
+
+The real `_prefill_spans_with_tail_grid(673-1, tail_interval=256, chunk_size=2048)` returns
+[(0,256),(256,512),(512,672)]. The last token uses its separate pass. The default compiled-width
+2048 therefore excludes the ordinary suffix blocks. A new experimental battery arm uses existing
+`MTPLX_QSA_PREFILL_COMPILE_ROWS=256`, with fused and compiled enabled, while retaining cap8 and
+tail_interval256. This changes only the canonical compiled shape, not the boundary grid.
+
+The first matched pair at 101296 cold tokens / 101289 cached + 673 new follow-up tokens:
+
+| arm | follow-up s | compiled selector calls in follow-up | sampled short/long fingerprint |
+|---|---|---|---|
+| baseline | 1.385912 | 0 | reference |
+| compiled_suffix256 | 1.441413 | 26 | match |
+
+The candidate actually executes in the intended phase but supplies no positive speed signal. It
+was not enabled; one slightly slower sample is not a statistical proof of regression. Existing
+`tests/test_qsa_indexer_compile.py` passed (16 tests), and the real serving slice passed input,
+engagement and greedy-output checks. Those unit tests are not a substitute for real-model evidence.
+
+Since baseline itself was below the numeric target, two additional fresh-process baseline rounds
+were measured without further configuration changes. Follow-ups: **1.385911626, 1.370241208,
+1.390001917 s**; median **1.385911626 s**. Cold median **104.529557791 s**. All corresponding input
+hashes, output fingerprints and control environments match across these baseline runs.
+
+**The 1.40 s threshold is met in this current ~101k sample, without a new optimization.** This is
+not evidence that the original 103k/556-token shape was revalidated, that retained-context scaling
+has disappeared, or that the lower baseline than the earlier 1.652785 s median was caused by a code
+change. Its cause has not been isolated. Criterion 3 remains open beyond this measured subcase.
+The safe serving configuration remains sparse QSA enabled, compiled indexer disabled, boundary cap8.
 

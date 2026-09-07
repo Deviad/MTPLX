@@ -1,204 +1,265 @@
 #!/usr/bin/env python3
-"""Screen the opt-in QSA kernels against the remaining criterion-3 gap.
+"""Compare QSA routes and boundary budgets on an isolated serving port.
 
-The QSA sparse prefill lane is on by default once its native extension is built,
-and it took the 103 k follow-up from 2.805 s to 1.56 s -- still 11.4 % above the
-1.40 s target that `docs/plans/2026-09-06-long-context-prefill-handoff.md` sets.
-Four opt-in kernels around the indexer and the gather are off by default and no
-profile sets them, so they are the levers that are left. This screens them one
-env at a time on a side-by-side port and checks output exactness beside speed,
-because three of them are declared *exact* selectors: a kernel that is faster and
-different is not a candidate, it is a regression with good manners.
-
-Discipline, the same as the lane sweep this reuses: one arm per server process,
-the session bank emptied per arm so every cold row is genuinely cold, and the
-arm's own env recorded in the row so the table cannot be read without it.
-
-  python3 scripts/qsa_optin_battery.py --port 9003 --contexts 104k
-  python3 scripts/qsa_optin_battery.py --port 9003 --contexts 104k --rounds 2
+The operator wrapper must honor MTPLX_BENCH_BANK. Banks and raw receipts are
+retained beside --out. Only the process launched by this script is stopped.
 """
-
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import shutil
+from pathlib import Path
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prefill_lane_sweep as sweep
+import prefill_probe as probe
 
-import prefill_lane_sweep as sweep  # noqa: E402  (stop/boot/row helpers)
-import prefill_probe as probe  # noqa: E402  (filler text + SALT)
-
-MTPLX_HOME = Path(os.environ.get("MTPLX_HOME", Path.home() / ".mtplx"))
-
-# Off by default in the model, registered as overridable in profiles.py, and not
-# set by any profile -- which is exactly why they are still unmeasured here.
-ARMS: dict[str, dict[str, str]] = {
+ARMS = {
     "baseline": {},
     "gather": {"MTPLX_QSA_GATHER": "1"},
     "fused_indexer": {"MTPLX_FUSED_QSA_INDEXER": "1"},
-    "compiled_indexer": {"MTPLX_COMPILED_QSA_INDEXER": "1"},
+    "compiled_indexer": {
+        "MTPLX_FUSED_QSA_INDEXER": "1",
+        "MTPLX_COMPILED_QSA_INDEXER": "1",
+    },
+    "compiled_suffix256": {
+        "MTPLX_FUSED_QSA_INDEXER": "1",
+        "MTPLX_COMPILED_QSA_INDEXER": "1",
+        "MTPLX_QSA_PREFILL_COMPILE_ROWS": "256",
+    },
+    "boundary32": {"MTPLX_GDN_BOUNDARY_MAX": "32"},
 }
-
-# Fixed prompt for the exactness leg: short, so it costs seconds, and greedy, so
-# a differing completion is a real divergence rather than sampler noise.
-EXACTNESS_PROMPT = (
-    "Reply with exactly one sentence naming the three primary colours, "
-    "in alphabetical order, separated by commas."
-)
-EXACTNESS_TOKENS = 64
-
-ROW_FIELDS = (
-    "prompt_tokens",
-    "cached_tokens",
-    "new_prefill_tokens",
-    "prompt_eval_time_s",
-    "prompt_suffix_time_s",
-    "prompt_repair_time_s",
-    "prompt_mtp_history_time_s",
-    "prompt_eval_breakdown_complete",
-    "prefill_layout",
-    "prefill_attention_impl",
-    "peak_memory_bytes",
-    "session_restore_mode",
+CONTROL_ENV = {
+    "MTPLX_QSA_GATHER": "0",
+    "MTPLX_FUSED_QSA_INDEXER": "0",
+    "MTPLX_COMPILED_QSA_INDEXER": "0",
+    "MTPLX_QSA_PREFILL_COMPILE_ROWS": "2048",
+    "MTPLX_QSA_SCORE_TILE_ROWS": "0",
+    "MTPLX_QSA_PREFILL": "1",
+    "MTPLX_GDN_BOUNDARY_MAX": "8",
+    "MTPLX_GDN_BOUNDARY_TAIL_INTERVAL": "256",
+    "MTPLX_SHUTDOWN_SSD_FLUSH_S": "60",
+}
+RUN_TAG = "qsa-battery"
+SHORT_QUESTION = "Name the three primary colours in alphabetical order."
+LONG_QUESTION = (
+    "Considering everything above, state which single word appears most often "
+    "in it, then repeat that word in parentheses."
 )
 
 
-def post_json(url: str, payload: dict, timeout: float) -> dict:
-    body = json.dumps(payload).encode()
+def post_json(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as handle:
-        return json.loads(handle.read().decode())
+    with urllib.request.urlopen(request, timeout=1800) as response:
+        return json.load(response)
+
+
+def health() -> dict:
+    with urllib.request.urlopen(f"http://127.0.0.1:{sweep.PORT}/health", timeout=15) as response:
+        return json.load(response)
 
 
 def completion_fingerprint(response: dict) -> str:
-    """Everything a greedy run can differ in, as one comparable string.
-
-    `content` alone is not enough, and the first rehearsal showed why: with
-    reasoning enabled the model can spend the whole token budget thinking and
-    return an empty `content`, so every arm "matched" on an empty string. The
-    fingerprint carries the reasoning text and the finish reason beside it.
-    """
-    try:
-        choice = response["choices"][0]
-    except (KeyError, IndexError, TypeError):
-        return json.dumps(response, sort_keys=True)[:800]
-    message = choice.get("message") or {}
-    return json.dumps(
-        {
-            "finish_reason": choice.get("finish_reason"),
-            "content": message.get("content"),
-            "reasoning_content": message.get("reasoning_content"),
-            "tool_calls": message.get("tool_calls"),
-        },
-        sort_keys=True,
-    )
+    choice = response["choices"][0]
+    message = choice["message"]
+    if not any(message.get(k) for k in ("content", "reasoning_content", "tool_calls")):
+        raise ValueError("empty completion: exactness cannot be compared")
+    return json.dumps({
+        "finish_reason": choice["finish_reason"],
+        **{k: message.get(k) for k in ("content", "reasoning_content", "tool_calls")},
+    }, sort_keys=True)
 
 
-def rows_after(offset: int) -> list[dict]:
-    out = []
-    if not sweep.LOG_ROWS.exists():
-        return out
-    with sweep.LOG_ROWS.open() as handle:
-        handle.seek(offset)
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return out
-
-
-def run_arm(arm: str, rnd: int, contexts: str, boot_limit_s: int) -> dict:
-    env_overrides = ARMS[arm]
-    sweep.stop_server()
-    if sweep.BANK.exists():
-        shutil.rmtree(sweep.BANK, ignore_errors=True)
-    sweep.BANK.mkdir(parents=True, exist_ok=True)
-
-    env = dict(os.environ)
-    env.update(env_overrides)
-    serve_log = MTPLX_HOME / "logs" / f"qsa-battery-{arm}-r{rnd}-serve.log"
-    handle = serve_log.open("w")
-    proc = subprocess.Popen(
-        ["/bin/bash", str(sweep.SERVE)],
-        env=env,
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    rec: dict = {
-        "arm": arm,
-        "round": rnd,
-        "pid": proc.pid,
-        "arm_env": dict(env_overrides),
-        "serve_log": str(serve_log),
+def arm_environment(arm: str, bank: Path, engagement: Path) -> dict[str, str]:
+    return {
+        **os.environ, **CONTROL_ENV, **ARMS[arm],
+        "MTPLX_BENCH_BANK": str(bank),
+        "MTPLX_QSA_PREFILL_ENGAGEMENT_FILE": str(engagement),
     }
-    try:
-        if not sweep.wait_healthy(boot_limit_s):
-            rec["error"] = "server did not become healthy"
-            return rec
-        base = f"http://127.0.0.1:{sweep.PORT}"
 
-        # Speed leg: one cold prefill plus the follow-up that criterion 3 is about.
-        offset = sweep.LOG_ROWS.stat().st_size if sweep.LOG_ROWS.exists() else 0
-        tag = f"qsabatt-{arm}"
-        probe_out = sweep.sh(
-            [
-                sys.executable, str(sweep.PROBE), "--port", str(sweep.PORT),
-                "--contexts", contexts, "--tag", tag, "--unique-body",
-                "--max-new-tokens", "1",
-            ],
-            timeout=2400,
-        )
-        rec["probe_tail"] = probe_out.strip().splitlines()[-1] if probe_out.strip() else ""
-        rows = rows_after(offset)
-        cold = [r for r in rows if (r.get("cached_tokens") or 0) == 0]
-        warm = [r for r in rows if (r.get("cached_tokens") or 0) > 0]
-        for label, picked in (("cold", cold[-1] if cold else {}),
-                              ("followup", warm[-1] if warm else {})):
-            for key in ROW_FIELDS:
-                rec[f"{label}_{key}"] = picked.get(key)
-            new = picked.get("new_prefill_tokens") or 0
-            ev = picked.get("prompt_eval_time_s") or 0
-            rec[f"{label}_ms_per_new_token"] = round(ev * 1000 / new, 3) if new and ev else None
 
-        # Exactness leg: greedy, fixed prompt, compared across arms afterwards.
-        offset2 = sweep.LOG_ROWS.stat().st_size if sweep.LOG_ROWS.exists() else 0
-        response = post_json(
-            f"{base}/v1/chat/completions",
-            {
-                "messages": [{"role": "user", "content": EXACTNESS_PROMPT}],
-                "max_tokens": EXACTNESS_TOKENS,
-                "temperature": 0,
-                "stream": False,
-            },
-            600.0,
-        )
-        rec["exactness_fingerprint"] = completion_fingerprint(response)
-        rec["exactness_bytes"] = len(rec["exactness_fingerprint"])
-        exact_rows = rows_after(offset2)
-        if exact_rows:
-            fm4 = (exact_rows[-1].get("compiled_verify") or {}).get("fixed_m4") or {}
-            rec["exactness_aux_route"] = fm4.get("aux_route")
-        rec["ok"] = True
-    except Exception as exc:  # noqa: BLE001 - one arm failing must not kill the run
-        rec["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        sweep.stop_server()
-        handle.close()
-    return rec
+def dir_bytes(path: Path) -> int:
+    result = subprocess.run(["du", "-sk", str(path)], capture_output=True, text=True, check=True)
+    return int(result.stdout.split()[0]) * 1024
+
+
+def bank_state() -> dict:
+    return health()["session_bank"]
+
+
+def wait_for_writer_queue(limit_s: int = 300) -> dict:
+    """Drain staged writes; scheduler-held persistence is flushed at shutdown."""
+    deadline = time.monotonic() + limit_s
+    while True:
+        state = bank_state()
+        cold = state["cold_tier"]
+        if not cold["writer_queue_depth"] and not cold["writer_backlog_bytes"]:
+            return state
+        if time.monotonic() >= deadline:
+            raise TimeoutError("SSD writer has not drained; bank bytes are not settled")
+        time.sleep(2)
+
+
+def engagement_counts(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def request_leg(messages: list[dict], max_tokens: int, dest: Path, engagement: Path) -> dict:
+    offset = sweep.LOG_ROWS.stat().st_size if sweep.LOG_ROWS.exists() else 0
+    counts_before = engagement_counts(engagement)
+    started = time.monotonic()
+    response = post_json(f"http://127.0.0.1:{sweep.PORT}/v1/chat/completions", {
+        "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": False,
+    })
+    elapsed = time.monotonic() - started
+    dest.write_text(json.dumps(response, indent=2) + "\n")
+    rows = []
+    for _ in range(50):
+        with sweep.LOG_ROWS.open() as handle:
+            handle.seek(offset)
+            appended = [json.loads(line) for line in handle if line.strip()]
+            rows = [row for row in appended if row.get("request_id") == response["id"]]
+            if any(row.get("request_id") not in (None, response["id"]) for row in appended):
+                raise ValueError("another client used the benchmark port")
+        if rows:
+            break
+        time.sleep(0.1)
+    if len(rows) != 1:
+        raise ValueError(f"expected one exclusive request row, got {len(rows)}")
+    counts_after = engagement_counts(engagement)
+    return {
+        "wall_s": elapsed, "row": rows[0],
+        "response_path": str(dest),
+        "prompt_sha256": hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest(),
+        "fingerprint": completion_fingerprint(response),
+        "engagement": {k: v - counts_before.get(k, 0) for k, v in counts_after.items()},
+    }
+
+
+def run_arm(arm: str, rnd: int, tokens: int, output_dir: Path, boot_limit_s: int,
+            memory_only: bool = False) -> dict:
+    if sweep.listener_pid():
+        raise RuntimeError(f"port {sweep.PORT} already occupied; refusing to stop its owner")
+    work = Path(tempfile.mkdtemp(prefix=f"{arm}-r{rnd}-", dir=output_dir))
+    bank = work / "bank"
+    bank.mkdir()
+    engagement = work / "engagement.json"
+    env = arm_environment(arm, bank, engagement)
+    record = {
+        "arm": arm, "round": rnd, "work_dir": str(work),
+        "started_at": time.time(),
+        "swap_before": subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                                      capture_output=True, text=True, check=True).stdout.strip(),
+        "arm_env": {k: env[k] for k in CONTROL_ENV}, "ok": False,
+    }
+    seed = f"{probe.SALT}-{RUN_TAG}-{tokens}"
+    messages = [{"role": "user", "content": f"[probe {seed}]\n{probe.unique_filler(tokens, seed)}"}]
+    legs = [
+        ("cold", messages, 1),
+        ("followup", messages + [{"role": "user", "content": probe.unique_filler(700, seed + "-fu")}], 1),
+        ("short", [{"role": "user", "content": SHORT_QUESTION}], 64),
+        ("long", messages + [{"role": "user", "content": LONG_QUESTION}], 48),
+    ]
+    if memory_only:
+        legs = legs[:1]
+    with (work / "serve.log").open("w") as log:
+        proc = subprocess.Popen(["/bin/bash", str(sweep.SERVE)], env=env,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        record["pid"] = proc.pid
+        try:
+            if not sweep.wait_healthy(boot_limit_s):
+                raise TimeoutError("server did not become healthy")
+            startup = health()
+            (work / "startup-health.json").write_text(json.dumps(startup, indent=2) + "\n")
+            if Path(startup["session_bank"]["cold_tier"]["dir"]).resolve() != bank.resolve():
+                raise ValueError("wrapper did not honor MTPLX_BENCH_BANK; no requests sent")
+            for name, payload, count in legs:
+                leg = request_leg(payload, count, work / f"{name}-response.json", engagement)
+                record[name] = leg
+                if name == "cold" and leg["row"]["cached_tokens"] != 0:
+                    raise ValueError("cold leg hit a cache")
+                if name in ("followup", "long") and leg["row"]["cached_tokens"] <= 0:
+                    raise ValueError(f"{name} leg missed the long prefix")
+                print(f"  {arm} r{rnd} {name}: eval={leg['row']['prompt_eval_time_s']:.3f}s "
+                      f"cached={leg['row']['cached_tokens']} new={leg['row']['new_prefill_tokens']} "
+                      f"compiled={leg['engagement'].get('compiled_selector', 0)}", flush=True)
+            record["bank_state"] = wait_for_writer_queue()
+            record["bank_bytes_after"] = dir_bytes(bank)
+            record["engagement"] = engagement_counts(engagement)
+            # Small rungs only rehearse plumbing; they cannot establish engagement at depth.
+            if arm == "compiled_indexer" and tokens >= 32768:
+                if record["engagement"].get("compiled_selector", 0) <= 0:
+                    raise ValueError("compiled arm did not execute the compiled selector")
+            if arm == "compiled_suffix256" and tokens >= 32768 and not memory_only:
+                if record["followup"]["engagement"].get("compiled_selector", 0) <= 0:
+                    raise ValueError("suffix256 arm did not execute compiled selection in the follow-up")
+            record["ok"] = True
+        except Exception as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                record["shutdown_forced"] = True
+            record["server_exit"] = proc.returncode
+            record["bank_bytes_stopped"] = dir_bytes(bank)
+            record["finished_at"] = time.time()
+    if memory_only and record["ok"]:
+        with sqlite3.connect(f"file:{bank / 'manifest.sqlite'}?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            record["persisted_entries"] = [dict(row) for row in db.execute(
+                "SELECT prefix_len, token_hash, entry_dir, nbytes, logical_nbytes, "
+                "physical_nbytes FROM entries"
+            )]
+        if len(record["persisted_entries"]) != 1:
+            record["ok"] = False
+            record["error"] = "single-cold memory slice must persist exactly one entry"
+    (work / "record.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def comparisons(records: list[dict]) -> bool:
+    baselines = [r for r in records if r["arm"] == "baseline" and r["ok"]]
+    if not baselines:
+        print("No successful baseline: comparison unavailable")
+        return False
+    reference = baselines[0]
+    valid = True
+    for record in records:
+        if not record["ok"]:
+            print(record["arm"], record.get("error"))
+            valid = False
+            continue
+        if "persisted_entries" in reference:
+            ref_entry = reference["persisted_entries"][0]
+            entries = record.get("persisted_entries", [])
+            same_entry = len(entries) == 1 and all(
+                entries[0][key] == ref_entry[key] for key in ("prefix_len", "token_hash")
+            )
+            print(f"{record['arm']}: same_persisted_tokens={same_entry}")
+            valid = valid and same_entry
+        for leg in ("cold", "followup", "short", "long"):
+            if leg not in reference and leg not in record:
+                continue
+            same_input = record[leg]["prompt_sha256"] == reference[leg]["prompt_sha256"]
+            same_output = record[leg]["fingerprint"] == reference[leg]["fingerprint"]
+            print(f"{record['arm']} r{record['round']} {leg}: "
+                  f"same_input={same_input} same_output={same_output}")
+            valid = valid and same_input and same_output
+    return valid
 
 
 def main() -> int:
@@ -207,71 +268,35 @@ def main() -> int:
     ap.add_argument("--contexts", default="104k")
     ap.add_argument("--rounds", type=int, default=1)
     ap.add_argument("--boot-limit-s", type=int, default=420)
-    ap.add_argument("--arms", default="", help="comma-separated subset of arm names")
-    ap.add_argument("--out", default="")
+    ap.add_argument("--arms", default="baseline,compiled_indexer")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--memory-only", action="store_true",
+                    help="One cold request per arm, then verify persisted entry identity")
     args = ap.parse_args()
-
-    sweep.configure(
-        port=args.port,
-        serve=os.environ.get("MTPLX_LANE_SWEEP_SERVE", ""),
-        bank=os.environ.get("MTPLX_LANE_SWEEP_BANK", ""),
-        probe=os.environ.get("MTPLX_LANE_SWEEP_PROBE", ""),
-        contexts=args.contexts,
-    )
-    names = [a.strip() for a in args.arms.split(",") if a.strip()] or list(ARMS)
-    unknown = [n for n in names if n not in ARMS]
-    if unknown:
-        ap.error(f"unknown arms: {unknown}; known: {sorted(ARMS)}")
-
-    out = Path(args.out or (MTPLX_HOME / "bench" /
-                            f"qsa-battery-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
+    names = args.arms.split(",")
+    rungs = probe.parse_rungs(args.contexts)
+    if len(rungs) != 1 or args.rounds < 1 or any(n not in ARMS for n in names):
+        ap.error("use one rung, positive rounds, and known arms")
+    if args.port in (9001, 9002):
+        ap.error("production ports are excluded from this battery")
+    sweep.configure(port=args.port, serve=os.environ.get("MTPLX_LANE_SWEEP_SERVE", ""))
+    out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    print(f"qsa opt-in battery -> {out}", flush=True)
-    print(f"arms: {names} | contexts {args.contexts} | rounds {args.rounds}", flush=True)
-
     records = []
-    for rnd in range(1, args.rounds + 1):
-        for arm in names:
-            print(f"[round {rnd}] {arm}: booting ...", flush=True)
-            rec = run_arm(arm, rnd, args.contexts, args.boot_limit_s)
-            records.append(rec)
-            with out.open("a") as handle:
-                handle.write(json.dumps(rec, sort_keys=True) + "\n")
-            if rec.get("error"):
-                print(f"[round {rnd}] {arm}: ERROR {rec['error']}", flush=True)
-            else:
-                print(
-                    f"[round {rnd}] {arm}: cold={rec.get('cold_prompt_eval_time_s')}s "
-                    f"followup={rec.get('followup_prompt_eval_time_s')}s "
-                    f"ms/new={rec.get('followup_ms_per_new_token')}",
-                    flush=True,
-                )
-
-    print()
-    header = (f"{'arm':<18} {'cold_s':>8} {'fu_s':>7} {'fu ms/new':>10} "
-              f"{'cold tok/s':>11} {'exactness':>10}")
-    print(header)
-    reference = next((r.get("exactness_fingerprint") for r in records
-                      if r.get("arm") == "baseline" and r.get("exactness_fingerprint")), None)
-    for rec in records:
-        cold_new = rec.get("cold_new_prefill_tokens") or 0
-        cold_ev = rec.get("cold_prompt_eval_time_s") or 0
-        cold_rate = round(cold_new / cold_ev, 1) if cold_new and cold_ev else None
-        text = rec.get("exactness_fingerprint")
-        if not text:
-            same = "no answer"
-        elif reference is None:
-            same = "no baseline"
-        else:
-            same = "match" if text == reference else "DIFFERS"
-        print(f"{rec.get('arm','?'):<18} "
-              f"{str(round(cold_ev, 2) if cold_ev else None):>8} "
-              f"{str(round(rec.get('followup_prompt_eval_time_s') or 0, 3) or None):>7} "
-              f"{str(rec.get('followup_ms_per_new_token')):>10} "
-              f"{str(cold_rate):>11} {same:>10}")
-    if reference is None:
-        print("\nno baseline fingerprint: the greedy comparison could not be made")
-    return 0
+    with out.open("x") as handle:
+        for rnd in range(1, args.rounds + 1):
+            # Reverse alternate rounds to avoid always putting the candidate last.
+            for arm in names if rnd % 2 else reversed(names):
+                print(f"[round {rnd}] {arm}: booting", flush=True)
+                record = run_arm(arm, rnd, rungs[0], out.parent, args.boot_limit_s,
+                                 memory_only=args.memory_only)
+                records.append(record)
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+                if not record["ok"]:
+                    print(record.get("error"), flush=True)
+                    return 1
+    return 0 if comparisons(records) else 1
 
 
 if __name__ == "__main__":
