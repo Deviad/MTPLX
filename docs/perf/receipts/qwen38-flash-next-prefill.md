@@ -669,3 +669,55 @@ candidate worth a confirmation battery, and it is already reachable per port (it
 `MODEL_RUNTIME_ENV_OVERRIDE_KEYS`, `profiles.py:323`), so enabling it needs no code change -- which
 is also why it must be measured properly before anyone flips it.
 
+## A diverging continuation is priced by the boundary budget, and the budget is a knob (2026-09-07 02:02)
+
+The 36.57 s diverging continuation reported earlier is not a defect and not an eviction: it is
+`MTPLX_GDN_BOUNDARY_MAX`, whose default is **8**.
+
+Mechanism, from the code. A hybrid model can only resume its recurrent state at a token whose state
+was actually captured, so a restore lands on the newest stored boundary at or below the match
+(`session_bank.py:460-471 recurrent_boundary_at_or_below`). Boundaries are captured at chunk edges
+during cold prefill, with a finer 256-token grid inside the *final* chunk because "agent/RAG
+divergence concentrates near the prompt tail" (`generation.py:4213-4224`), and the list is capped at
+`MTPLX_GDN_BOUNDARY_MAX` snapshots -- over the cap it is re-thinned to geometric distance-from-tail
+coverage (`generation.py:4300-4325`), because each snapshot is MB-scale (conv tail plus GDN matrix
+state for the recurrent layers). Eight slots over a 101 k prompt is a coarse grid, so a divergence
+that lands mid-prefix re-prefills thousands of tokens.
+
+Measured, same shape both times -- a prompt whose continuation diverges from the stored chain, on the
+side-by-side 9003 at the 104 k rung:
+
+| `MTPLX_GDN_BOUNDARY_MAX` | restore point | gap below the match | new tokens | prompt eval | suffix |
+|---|---|---|---|---|---|
+| 8 (default), 23:30 | 94 208 | 7 097 | 7 776 | **36.57 s** | 33.998 s |
+| 8 (default), 23:30 | 96 256 | ~5 100 | 5 726 | 26.90 s | 24.905 s |
+| **32**, 02:02 | **101 120** | **~230** | **485** | **0.702 s** | 0.661 s |
+
+The causal fact is the restore point, which does not depend on machine load: the gap falls from
+7 097 tokens to ~230, and the re-prefill falls from 7 776 tokens to 485. The two runs were not taken
+under the same load (the later one had three packs resident and 26 % memory free), so the wall-clock
+ratio is not a clean A/B -- but a 7 776-token re-prefill against a 485-token one needs no clean A/B
+to be understood, and the per-token costs agree with the curve (4.45 ms/token at cap 8, 1.36 ms/token
+at cap 32, the latter back near the short-context rate because there is almost nothing left to
+re-prefill).
+
+What the knob costs, and what it does not:
+
+- **Cold prefill does not pay for it.** With the cap at 32 the 104 k cold row is 119.59 s / 847.5
+  tok/s, against 117.0-118.6 s for the four arms of the battery above in the same loaded session --
+  inside the noise, so capturing four times the boundaries is not a prefill tax.
+- **Memory is the price and it is not fully quantified here.** One 104 k entry with the cap at 32
+  occupies 11 GB in `$MTPLX_HOME/session-bank/flash-next-repo-9003`, and the rows report
+  `cache_memory_bytes` 7.97-7.99 GiB. The same measurement at the default cap was not taken in this
+  session, so the *marginal* cost of raising 8 -> 32 is unmeasured; the code's own note ("MB-scale per
+  boundary") implies a few GB across 24 extra snapshots, and that is an inference, not a number. The
+  measurement that would settle it is one `du` of the bank directory under each cap.
+- **It only prices diverging continuations.** A turn that extends the stored chain restores with
+  `near_prefix_clone` at the full match (101 305 of 101 305) and never touches the boundary grid, so
+  ordinary agent turns are unaffected by this knob either way.
+
+So the earlier "trimmed snapshot" wording was wrong in an important way: nothing was trimmed by a byte
+budget, the restore simply could not go past the last captured boundary. Whether to raise the default
+is a product decision -- memory per session against the cost of an edited or branched conversation --
+and it now has numbers on both sides of it except the one just named.
+
